@@ -430,7 +430,7 @@ full_optimize() {
     echo "╚══════════════════════════════════════╝"
     echo -e "${NC}"
 
-    TOTAL=9
+    TOTAL=8
     CURRENT=0
 
     step_progress() {
@@ -438,7 +438,6 @@ full_optimize() {
         echo -e "${CYAN}  [Step $CURRENT/$TOTAL]${NC}"
     }
 
-    step_progress; run_step "Install Tools"      install_tools
     step_progress; run_step "Kill Bloatware"     kill_bloat
     step_progress; run_step "Disable Animasi"    disable_animations
     step_progress; run_step "Optimasi Memory"    optimize_memory
@@ -450,7 +449,7 @@ full_optimize() {
 
     # set_roblox_priority dijalankan terakhir langsung (butuh Roblox sudah berjalan)
     echo -e "\n${CYAN}┌─────────────────────────────────────────┐${NC}"
-    echo -e "${CYAN}│ ▶ [Step 10/10] Set Roblox Priority      │${NC}"
+    echo -e "${CYAN}│ ▶ [Step 9/9] Set Roblox Priority        │${NC}"
     echo -e "${CYAN}└─────────────────────────────────────────┘${NC}"
     set_roblox_priority
 
@@ -486,6 +485,8 @@ if [ "$1" == "--auto" ]; then
     full_optimize
     exit 0
 fi
+
+install_tools
 
 while true; do
     show_menu
