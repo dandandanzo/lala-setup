@@ -253,39 +253,6 @@ optimize_network() {
     echo -e "${GREEN}[✓] Jaringan dioptimasi${NC}"
 }
 
-# === SET ROBLOX PRIORITY (AUTO DETECT) ===
-set_roblox_priority() {
-    echo -e "${YELLOW}[*] Mendeteksi package Roblox...${NC}"
-
-    ROBLOX_PACKAGES=$(su -c "pm list packages" 2>/dev/null | grep "com.roblox" | sed 's/package://')
-
-    if [ -z "$ROBLOX_PACKAGES" ]; then
-        echo -e "${RED}[!] Tidak ada package Roblox ditemukan di device!${NC}"
-        return
-    fi
-
-    echo -e "${GREEN}[✓] Package ditemukan:${NC}"
-    echo "$ROBLOX_PACKAGES"
-
-    for PKG in $ROBLOX_PACKAGES; do
-        echo -e "${YELLOW}[*] Mengatur prioritas: $PKG${NC}"
-
-        PIDS=$(su -c "pidof $PKG" 2>/dev/null)
-
-        if [ -z "$PIDS" ]; then
-            echo -e "${YELLOW}[!] $PKG belum berjalan, skip...${NC}"
-            continue
-        fi
-
-        for PID in $PIDS; do
-            su -c "renice -10 -p $PID" 2>/dev/null
-            su -c "chrt -f -p 10 $PID" 2>/dev/null
-            su -c "echo -500 > /proc/$PID/oom_score_adj" 2>/dev/null
-            echo -e "${GREEN}[✓] PID $PID ($PKG) prioritas ditingkatkan${NC}"
-        done
-    done
-}
-
 # === DISABLE SERVICES TIDAK PENTING ===
 disable_services() {
     echo -e "${YELLOW}[*] Menonaktifkan service tidak penting...${NC}"
@@ -374,7 +341,6 @@ exit_script() {
     echo -e "${CYAN}╠══════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║ ✅ Tweak kernel/memory → masih aktif     ║${NC}"
     echo -e "${CYAN}║ ✅ Animasi nonaktif → masih nonaktif     ║${NC}"
-    echo -e "${CYAN}║ ✅ Prioritas Roblox → masih aktif        ║${NC}"
     echo -e "${CYAN}║ ✅ Auto memory cleaner → tetap jalan     ║${NC}"
     echo -e "${CYAN}║ ⚠️  Semua reset otomatis saat reboot     ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
@@ -447,12 +413,6 @@ full_optimize() {
     step_progress; run_step "Disable Services"   disable_services
     step_progress; run_step "Auto Clean Memory"  auto_clean_memory
 
-    # set_roblox_priority dijalankan terakhir langsung (butuh Roblox sudah berjalan)
-    echo -e "\n${CYAN}┌─────────────────────────────────────────┐${NC}"
-    echo -e "${CYAN}│ ▶ [Step 9/9] Set Roblox Priority        │${NC}"
-    echo -e "${CYAN}└─────────────────────────────────────────┘${NC}"
-    set_roblox_priority
-
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║       ✓ SEMUA LANGKAH SELESAI!       ║${NC}"
@@ -469,15 +429,14 @@ show_menu() {
     echo -e "${CYAN}║ 1.  Full Optimize (Auto)       ║${NC}"
     echo -e "${CYAN}║ 2.  Optimize Memory Only       ║${NC}"
     echo -e "${CYAN}║ 3.  Optimize CPU/GPU           ║${NC}"
-    echo -e "${CYAN}║ 4.  Set Roblox Priority        ║${NC}"
-    echo -e "${CYAN}║ 5.  Monitor RAM Live           ║${NC}"
-    echo -e "${CYAN}║ 6.  Disable Animasi            ║${NC}"
-    echo -e "${CYAN}║ 7.  Enable Animasi             ║${NC}"
-    echo -e "${CYAN}║ 8.  Cek & Install Tools        ║${NC}"
-    echo -e "${CYAN}║ 9.  Fix dpkg Lock              ║${NC}"
+    echo -e "${CYAN}║ 4.  Monitor RAM Live           ║${NC}"
+    echo -e "${CYAN}║ 5.  Disable Animasi            ║${NC}"
+    echo -e "${CYAN}║ 6.  Enable Animasi             ║${NC}"
+    echo -e "${CYAN}║ 7.  Cek & Install Tools        ║${NC}"
+    echo -e "${CYAN}║ 8.  Fix dpkg Lock              ║${NC}"
     echo -e "${CYAN}║ 0.  Keluar                     ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════╝${NC}"
-    echo -ne "Pilih [0-9]: "
+    echo -ne "Pilih [0-8]: "
 }
 
 # === RUN SCRIPT ===
@@ -486,7 +445,21 @@ if [ "$1" == "--auto" ]; then
     exit 0
 fi
 
-install_tools
+# Jalankan install_tools dengan spinner di awal
+SPIN='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+i=0
+echo -e "${CYAN}[*] Menyiapkan dependency...${NC}"
+(install_tools) > /dev/null 2>&1 &
+INIT_PID=$!
+while kill -0 $INIT_PID 2>/dev/null; do
+    i=$(( (i+1) % ${#SPIN} ))
+    echo -ne "\r${YELLOW}  [${SPIN:$i:1}] Menginstall tools, harap tunggu...${NC}   "
+    sleep 0.15
+done
+wait $INIT_PID
+echo -ne "\r                                                    \r"
+echo -e "${GREEN}  [✓] Tools siap!${NC}"
+sleep 0.5
 
 while true; do
     show_menu
@@ -495,12 +468,11 @@ while true; do
         1) full_optimize ;;
         2) optimize_memory ;;
         3) optimize_cpu; optimize_gpu ;;
-        4) set_roblox_priority ;;
-        5) monitor_ram ;;
-        6) disable_animations ;;
-        7) enable_animations ;;
-        8) install_tools ;;
-        9) fix_dpkg_lock ;;
+        4) monitor_ram ;;
+        5) disable_animations ;;
+        6) enable_animations ;;
+        7) install_tools ;;
+        8) fix_dpkg_lock ;;
         0) exit_script ;;
         *) echo -e "${RED}Pilihan tidak valid${NC}" ;;
     esac
