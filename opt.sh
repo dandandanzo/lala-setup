@@ -19,15 +19,6 @@ echo "║     Android 10 | RAM 4GB Optimizer   ║"
 echo "╚══════════════════════════════════════╝"
 echo -e "${NC}"
 
-# === CEK ROOT ===
-check_root() {
-    if ! su -c "echo root_ok" 2>/dev/null | grep -q "root_ok"; then
-        echo -e "${RED}[ERROR] Root diperlukan! Jalankan dengan su.${NC}"
-        exit 1
-    fi
-    echo -e "${GREEN}[✓] Root terdeteksi${NC}"
-}
-
 # ================================================
 # === FIX DPKG LOCK (TAMBAHAN BARU) ===
 # ================================================
@@ -179,39 +170,6 @@ enable_animations() {
     su -c "settings put system notification_animation 1" 2>/dev/null
 
     echo -e "${GREEN}[✓] Animasi dikembalikan ke normal${NC}"
-}
-
-# === ENABLE DEVELOPER OPTIONS SETTINGS ===
-enable_dev_options() {
-    echo -e "${YELLOW}[*] Mengaktifkan Developer Options settings...${NC}"
-
-    su -c "settings put global force_allow_on_external 1"
-    echo -e "${GREEN}[✓] Force allow apps on external → ON${NC}"
-
-    su -c "settings put global development_force_resizable_activities 1"
-    echo -e "${GREEN}[✓] Force activities to be resizable → ON${NC}"
-
-    su -c "settings put global enable_freeform_support 1"
-    echo -e "${GREEN}[✓] Enable freeform windows → ON${NC}"
-
-    su -c "settings put global force_desktop_mode_on_external_displays 1"
-    echo -e "${GREEN}[✓] Force desktop mode → ON${NC}"
-
-    su -c "am restart" 2>/dev/null || \
-    su -c "killall com.android.launcher3" 2>/dev/null
-    echo -e "${GREEN}[✓] Perubahan diterapkan${NC}"
-}
-
-# === DISABLE DEVELOPER OPTIONS SETTINGS (restore) ===
-disable_dev_options() {
-    echo -e "${YELLOW}[*] Mengembalikan Developer Options settings...${NC}"
-
-    su -c "settings put global force_allow_on_external 0"
-    su -c "settings put global development_force_resizable_activities 0"
-    su -c "settings put global enable_freeform_support 0"
-    su -c "settings put global force_desktop_mode_on_external_displays 0"
-
-    echo -e "${GREEN}[✓] Developer Options settings dikembalikan ke default${NC}"
 }
 
 # === OPTIMIZE MEMORY ===
@@ -417,7 +375,6 @@ exit_script() {
     echo -e "${CYAN}║ ✅ Tweak kernel/memory → masih aktif     ║${NC}"
     echo -e "${CYAN}║ ✅ Animasi nonaktif → masih nonaktif     ║${NC}"
     echo -e "${CYAN}║ ✅ Prioritas Roblox → masih aktif        ║${NC}"
-    echo -e "${CYAN}║ ✅ Dev Options → masih aktif             ║${NC}"
     echo -e "${CYAN}║ ✅ Auto memory cleaner → tetap jalan     ║${NC}"
     echo -e "${CYAN}║ ⚠️  Semua reset otomatis saat reboot     ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
@@ -437,8 +394,8 @@ run_step() {
     echo -e "${CYAN}│ ▶ Langkah: ${LABEL}${NC}"
     echo -e "${CYAN}└─────────────────────────────────────────┘${NC}"
 
-    # Jalankan fungsi di subshell background
-    ($FUNC) &
+    # Jalankan fungsi di subshell background, sembunyikan output
+    ($FUNC) > /dev/null 2>&1 &
     local STEP_PID=$!
 
     # Spinner selama proses berjalan
@@ -473,9 +430,7 @@ full_optimize() {
     echo "╚══════════════════════════════════════╝"
     echo -e "${NC}"
 
-    check_root
-
-    TOTAL=10
+    TOTAL=9
     CURRENT=0
 
     step_progress() {
@@ -486,7 +441,6 @@ full_optimize() {
     step_progress; run_step "Install Tools"      install_tools
     step_progress; run_step "Kill Bloatware"     kill_bloat
     step_progress; run_step "Disable Animasi"    disable_animations
-    step_progress; run_step "Enable Dev Options" enable_dev_options
     step_progress; run_step "Optimasi Memory"    optimize_memory
     step_progress; run_step "Optimasi CPU"       optimize_cpu
     step_progress; run_step "Optimasi GPU"       optimize_gpu
@@ -496,7 +450,7 @@ full_optimize() {
 
     # set_roblox_priority dijalankan terakhir langsung (butuh Roblox sudah berjalan)
     echo -e "\n${CYAN}┌─────────────────────────────────────────┐${NC}"
-    echo -e "${CYAN}│ ▶ [Step 11/11] Set Roblox Priority      │${NC}"
+    echo -e "${CYAN}│ ▶ [Step 10/10] Set Roblox Priority      │${NC}"
     echo -e "${CYAN}└─────────────────────────────────────────┘${NC}"
     set_roblox_priority
 
@@ -521,12 +475,10 @@ show_menu() {
     echo -e "${CYAN}║ 6.  Disable Animasi            ║${NC}"
     echo -e "${CYAN}║ 7.  Enable Animasi             ║${NC}"
     echo -e "${CYAN}║ 8.  Cek & Install Tools        ║${NC}"
-    echo -e "${CYAN}║ 9.  Enable Dev Options         ║${NC}"
-    echo -e "${CYAN}║ 10. Disable Dev Options        ║${NC}"
-    echo -e "${CYAN}║ 11. Fix dpkg Lock              ║${NC}"
+    echo -e "${CYAN}║ 9.  Fix dpkg Lock              ║${NC}"
     echo -e "${CYAN}║ 0.  Keluar                     ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════╝${NC}"
-    echo -ne "Pilih [0-11]: "
+    echo -ne "Pilih [0-9]: "
 }
 
 # === RUN SCRIPT ===
@@ -540,16 +492,14 @@ while true; do
     read -r CHOICE
     case $CHOICE in
         1) full_optimize ;;
-        2) check_root; optimize_memory ;;
-        3) check_root; optimize_cpu; optimize_gpu ;;
-        4) check_root; set_roblox_priority ;;
+        2) optimize_memory ;;
+        3) optimize_cpu; optimize_gpu ;;
+        4) set_roblox_priority ;;
         5) monitor_ram ;;
-        6) check_root; disable_animations ;;
-        7) check_root; enable_animations ;;
+        6) disable_animations ;;
+        7) enable_animations ;;
         8) install_tools ;;
-        9) check_root; enable_dev_options ;;
-        10) check_root; disable_dev_options ;;
-        11) fix_dpkg_lock ;;
+        9) fix_dpkg_lock ;;
         0) exit_script ;;
         *) echo -e "${RED}Pilihan tidak valid${NC}" ;;
     esac
