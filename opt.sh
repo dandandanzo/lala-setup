@@ -28,9 +28,56 @@ check_root() {
     echo -e "${GREEN}[✓] Root terdeteksi${NC}"
 }
 
+# ================================================
+# === FIX DPKG LOCK (TAMBAHAN BARU) ===
+# ================================================
+fix_dpkg_lock() {
+    LOCK_FILE="$PREFIX/var/lib/dpkg/lock-frontend"
+    LOCK_FILE2="$PREFIX/var/lib/dpkg/lock"
+
+    echo -e "${YELLOW}[*] Mengecek dpkg lock...${NC}"
+
+    # Cek apakah lock file ada
+    if [ -f "$LOCK_FILE" ] || [ -f "$LOCK_FILE2" ]; then
+
+        # Cari PID yang memegang lock
+        LOCK_PID=$(fuser "$LOCK_FILE" 2>/dev/null || fuser "$LOCK_FILE2" 2>/dev/null)
+
+        if [ -n "$LOCK_PID" ]; then
+            echo -e "${YELLOW}[!] Lock dipegang oleh PID: $LOCK_PID — mencoba kill...${NC}"
+            kill -9 $LOCK_PID 2>/dev/null
+            sleep 2
+
+            # Cek ulang apakah masih locked
+            STILL_LOCKED=$(fuser "$LOCK_FILE" 2>/dev/null || fuser "$LOCK_FILE2" 2>/dev/null)
+            if [ -n "$STILL_LOCKED" ]; then
+                echo -e "${RED}[!] Proses masih lock setelah kill, mencoba paksa hapus lock...${NC}"
+            fi
+        else
+            echo -e "${YELLOW}[!] Lock file ada tapi tidak ada proses aktif — stale lock, hapus langsung...${NC}"
+        fi
+
+        # Hapus lock file
+        rm -f "$LOCK_FILE" 2>/dev/null
+        rm -f "$LOCK_FILE2" 2>/dev/null
+        echo -e "${GREEN}[✓] Lock file dihapus${NC}"
+
+        # Repair dpkg state
+        echo -e "${YELLOW}[*] Memperbaiki dpkg state...${NC}"
+        dpkg --configure -a 2>/dev/null
+        echo -e "${GREEN}[✓] dpkg state diperbaiki${NC}"
+
+    else
+        echo -e "${GREEN}[✓] Tidak ada dpkg lock, lanjut...${NC}"
+    fi
+}
+
 # === UPDATE & INSTALL TOOLS (dengan deteksi dependency) ===
 install_tools() {
     echo -e "${YELLOW}[*] Mengecek dependency...${NC}"
+
+    # Fix lock sebelum install apapun
+    fix_dpkg_lock
 
     TOOLS=("procps" "htop" "lua53" "sqlite")
     MISSING=()
@@ -57,10 +104,30 @@ install_tools() {
         echo -e "${GREEN}[✓] Semua dependency sudah lengkap, skip install${NC}"
     else
         echo -e "${YELLOW}[*] Menginstall: ${MISSING[*]}...${NC}"
-        pkg update -y -q
-        pkg upgrade -y -q
-        pkg install -y -q "${MISSING[@]}"
-        echo -e "${GREEN}[✓] Semua dependency berhasil diinstall${NC}"
+
+        # Retry loop jika masih ada lock saat install
+        MAX_RETRY=3
+        RETRY=0
+        SUCCESS=false
+
+        while [ $RETRY -lt $MAX_RETRY ]; do
+            pkg update -y -q && pkg upgrade -y -q && pkg install -y -q "${MISSING[@]}"
+            if [ $? -eq 0 ]; then
+                SUCCESS=true
+                break
+            else
+                RETRY=$((RETRY + 1))
+                echo -e "${YELLOW}[!] Install gagal (percobaan $RETRY/$MAX_RETRY), fix lock lagi...${NC}"
+                fix_dpkg_lock
+                sleep 2
+            fi
+        done
+
+        if $SUCCESS; then
+            echo -e "${GREEN}[✓] Semua dependency berhasil diinstall${NC}"
+        else
+            echo -e "${RED}[✗] Gagal install setelah $MAX_RETRY percobaan. Cek koneksi atau jalankan ulang.${NC}"
+        fi
     fi
 }
 
@@ -118,23 +185,18 @@ enable_animations() {
 enable_dev_options() {
     echo -e "${YELLOW}[*] Mengaktifkan Developer Options settings...${NC}"
 
-    # Force allow apps on external storage
     su -c "settings put global force_allow_on_external 1"
     echo -e "${GREEN}[✓] Force allow apps on external → ON${NC}"
 
-    # Force activities to be resizable (multi-window)
     su -c "settings put global development_force_resizable_activities 1"
     echo -e "${GREEN}[✓] Force activities to be resizable → ON${NC}"
 
-    # Enable freeform windows
     su -c "settings put global enable_freeform_support 1"
     echo -e "${GREEN}[✓] Enable freeform windows → ON${NC}"
 
-    # Force desktop mode on secondary displays
     su -c "settings put global force_desktop_mode_on_external_displays 1"
     echo -e "${GREEN}[✓] Force desktop mode → ON${NC}"
 
-    # Restart launcher agar perubahan diterapkan
     su -c "am restart" 2>/dev/null || \
     su -c "killall com.android.launcher3" 2>/dev/null
     echo -e "${GREEN}[✓] Perubahan diterapkan${NC}"
@@ -340,7 +402,6 @@ exit_script() {
     echo ""
     echo -e "${YELLOW}[*] Keluar dari script...${NC}"
 
-    # Cek status mem_cleaner — BIARKAN TETAP JALAN
     CLEANER_PID=$(pgrep -f "mem_cleaner.sh")
     if [ -n "$CLEANER_PID" ]; then
         echo -e "${GREEN}[✓] Auto memory cleaner tetap berjalan di background (PID: $CLEANER_PID)${NC}"
@@ -365,25 +426,83 @@ exit_script() {
     exit 0
 }
 
+# === HELPER: JALANKAN STEP DENGAN SPINNER & TUNGGU SELESAI ===
+run_step() {
+    local LABEL="$1"
+    local FUNC="$2"
+    local SPIN='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=0
+
+    echo -e "\n${CYAN}┌─────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│ ▶ Langkah: ${LABEL}${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────┘${NC}"
+
+    # Jalankan fungsi di subshell background
+    ($FUNC) &
+    local STEP_PID=$!
+
+    # Spinner selama proses berjalan
+    while kill -0 $STEP_PID 2>/dev/null; do
+        i=$(( (i+1) % ${#SPIN} ))
+        echo -ne "\r${YELLOW}  [${SPIN:$i:1}] Menunggu ${LABEL} selesai...${NC}   "
+        sleep 0.15
+    done
+
+    # Tunggu dan ambil exit code
+    wait $STEP_PID
+    local STATUS=$?
+
+    # Hapus baris spinner, ganti dengan status final
+    echo -ne "\r                                                  \r"
+
+    if [ $STATUS -eq 0 ]; then
+        echo -e "${GREEN}  [✓] ${LABEL} → SELESAI${NC}"
+    else
+        echo -e "${RED}  [✗] ${LABEL} → GAGAL (exit: $STATUS), lanjut ke langkah berikutnya...${NC}"
+    fi
+
+    sleep 0.5
+    return $STATUS
+}
+
 # === FULL OPTIMIZE ===
 full_optimize() {
-    echo -e "${GREEN}[*] Menjalankan Full Optimization...${NC}"
+    echo -e "${GREEN}"
+    echo "╔══════════════════════════════════════╗"
+    echo "║     MEMULAI FULL OPTIMIZATION...     ║"
+    echo "╚══════════════════════════════════════╝"
+    echo -e "${NC}"
+
     check_root
-    install_tools
-    kill_bloat
-    disable_animations
-    enable_dev_options
-    optimize_memory
-    optimize_cpu
-    optimize_gpu
-    optimize_network
-    disable_services
-    auto_clean_memory
+
+    TOTAL=10
+    CURRENT=0
+
+    step_progress() {
+        CURRENT=$((CURRENT+1))
+        echo -e "${CYAN}  [Step $CURRENT/$TOTAL]${NC}"
+    }
+
+    step_progress; run_step "Install Tools"      install_tools
+    step_progress; run_step "Kill Bloatware"     kill_bloat
+    step_progress; run_step "Disable Animasi"    disable_animations
+    step_progress; run_step "Enable Dev Options" enable_dev_options
+    step_progress; run_step "Optimasi Memory"    optimize_memory
+    step_progress; run_step "Optimasi CPU"       optimize_cpu
+    step_progress; run_step "Optimasi GPU"       optimize_gpu
+    step_progress; run_step "Optimasi Network"   optimize_network
+    step_progress; run_step "Disable Services"   disable_services
+    step_progress; run_step "Auto Clean Memory"  auto_clean_memory
+
+    # set_roblox_priority dijalankan terakhir langsung (butuh Roblox sudah berjalan)
+    echo -e "\n${CYAN}┌─────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│ ▶ [Step 11/11] Set Roblox Priority      │${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────┘${NC}"
     set_roblox_priority
 
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║       ✓ OPTIMASI SELESAI!            ║${NC}"
+    echo -e "${GREEN}║       ✓ SEMUA LANGKAH SELESAI!       ║${NC}"
     echo -e "${GREEN}║   Siap untuk 5-6 instance Roblox     ║${NC}"
     echo -e "${GREEN}╚══════════════════════════════════════╝${NC}"
 }
@@ -404,9 +523,10 @@ show_menu() {
     echo -e "${CYAN}║ 8.  Cek & Install Tools        ║${NC}"
     echo -e "${CYAN}║ 9.  Enable Dev Options         ║${NC}"
     echo -e "${CYAN}║ 10. Disable Dev Options        ║${NC}"
+    echo -e "${CYAN}║ 11. Fix dpkg Lock              ║${NC}"
     echo -e "${CYAN}║ 0.  Keluar                     ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════╝${NC}"
-    echo -ne "Pilih [0-10]: "
+    echo -ne "Pilih [0-11]: "
 }
 
 # === RUN SCRIPT ===
@@ -429,6 +549,7 @@ while true; do
         8) install_tools ;;
         9) check_root; enable_dev_options ;;
         10) check_root; disable_dev_options ;;
+        11) fix_dpkg_lock ;;
         0) exit_script ;;
         *) echo -e "${RED}Pilihan tidak valid${NC}" ;;
     esac
