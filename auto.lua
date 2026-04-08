@@ -1,17 +1,4 @@
 #!/data/data/com.termux/files/usr/bin/lua
--- ============================================================
---   DanzoInstall Termux Manager v14
---   Website : https://danzoinstall.anistioj.workers.dev
---   Deps    : pkg install lua54 curl
---   
---   v14 Changes:
---   - Auto fetch folders from /api/folders (no more hardcoded)
---   - Show file count & size per folder in menu
---   - [R] to refresh folder list
---   v13 Changes:
---   - Fixed API query: ?folderId= + &limit=100
---   - Use downloadUrl from API instead of hardcoded R2 URL
--- ============================================================
 
 local BASE_URL  = "https://danzoinstall.anistioj.workers.dev"
 local R2_URL    = "https://pub-ff1d15d748904c1bb178166d90f22db5.r2.dev"
