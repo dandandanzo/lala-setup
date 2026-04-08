@@ -76,12 +76,6 @@ local function restore_tty()
     os.execute("stty sane </dev/tty 2>/dev/null")
 end
 
-local function get_filesize(path)
-    local f = io.open(path, "rb")
-    if not f then return 0 end
-    local s = f:seek("end") or 0; f:close(); return s
-end
-
 local function file_exists(path)
     if not path then return false end
     local f = io.open(path, "r")
