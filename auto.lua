@@ -1,9 +1,16 @@
 #!/data/data/com.termux/files/usr/bin/lua
 -- ============================================================
---   DanzoInstall Termux Manager v12
+--   DanzoInstall Termux Manager v14
 --   Website : https://danzoinstall.anistioj.workers.dev
---   Folder  : 9pxaypjv
 --   Deps    : pkg install lua54 curl
+--   
+--   v14 Changes:
+--   - Auto fetch folders from /api/folders (no more hardcoded)
+--   - Show file count & size per folder in menu
+--   - [R] to refresh folder list
+--   v13 Changes:
+--   - Fixed API query: ?folderId= + &limit=100
+--   - Use downloadUrl from API instead of hardcoded R2 URL
 -- ============================================================
 
 local BASE_URL  = "https://danzoinstall.anistioj.workers.dev"
@@ -13,14 +20,8 @@ local DEST         = "/storage/emulated/0/Download"
 local COOKIE_FILE  = "/storage/emulated/0/Download/cookie.txt"
 local WEBHOOK_CFG  = os.getenv("HOME") .. "/danzo_tmp/webhook.cfg"
 
--- ── Preset Folders ───────────────────────────────────────────
-local PRESET_FOLDERS = {
-    { name = "Codex",   id = "2z8whpzj" },
-    { name = "Cryptic", id = "844gr7st" },
-    { name = "Delta",   id = "f8ujxmej" },
-    { name = "PunkX",   id = "q78znem3" },
-    { name = "Ronix",   id = "dzf52ez7" },
-}
+-- ── Preset Folders (fetched from API) ────────────────────────
+local CACHED_FOLDERS = nil
 
 -- ── Warna ───────────────────────────────────────────────────
 local R  = "\27[0m"
@@ -125,7 +126,7 @@ local function ensure_deps()
 end
 
 -- ════════════════════════════════════════════════════════════
---   PARSE SELECTION (dari script user)
+--   PARSE SELECTION
 -- ════════════════════════════════════════════════════════════
 local function parse_selection(input, max)
     input = trim(input):lower()
@@ -157,7 +158,7 @@ local function parse_selection(input, max)
 end
 
 -- ════════════════════════════════════════════════════════════
---   INSTALL APK (persis snippet user)
+--   INSTALL APK
 -- ════════════════════════════════════════════════════════════
 local function install_apk(filepath, num, total)
     divider()
@@ -185,10 +186,10 @@ end
 -- ════════════════════════════════════════════════════════════
 --   FORWARD DECLARATION
 -- ════════════════════════════════════════════════════════════
-local menu_download  -- dideklarasi awal supaya menu_uninstall boleh panggil
+local menu_download
 
 -- ════════════════════════════════════════════════════════════
---   UNINSTALL (dari script user, dengan read_line fix)
+--   UNINSTALL
 -- ════════════════════════════════════════════════════════════
 local KNOWN_PACKAGES = {
     { name = "WhatsApp",    pkg = "com.whatsapp" },
@@ -244,7 +245,6 @@ local function menu_uninstall()
     local installed = {}
     local seen_pkg  = {}
 
-    -- Scan com.roblox* otomatis
     local roblox_pkgs = scan_by_keyword("com.roblox")
     for _, pkg in ipairs(roblox_pkgs) do
         if not seen_pkg[pkg] then
@@ -256,7 +256,6 @@ local function menu_uninstall()
         end
     end
 
-    -- Scan KNOWN_PACKAGES lainnya
     for _, entry in ipairs(KNOWN_PACKAGES) do
         if not seen_pkg[entry.pkg] and is_installed(entry.pkg) then
             table.insert(installed, entry)
@@ -264,7 +263,6 @@ local function menu_uninstall()
         end
     end
 
-    -- Tampilkan daftar
     divider()
     p(B.."  Package yang terdeteksi:"..NC); p("")
 
@@ -289,10 +287,8 @@ local function menu_uninstall()
     local input = trim(read_line())
     p("")
 
-    -- Kembali
     if input == "0" then return end
 
-    -- Scan keyword lain
     if input:lower() == "s" then
         pr(B.."  Keyword (mis: com.google): "..NC)
         local kw = trim(read_line())
@@ -324,7 +320,6 @@ local function menu_uninstall()
         divider(); p(""); return
     end
 
-    -- Manual input
     if input:lower() == "m" then
         pr(B.."  Package ID: "..NC)
         local pkg = trim(read_line())
@@ -338,7 +333,6 @@ local function menu_uninstall()
         p(""); return
     end
 
-    -- Pilih dari daftar
     if #installed == 0 then
         p(R.."  Tidak ada package untuk diuninstall."..NC); return
     end
@@ -353,7 +347,6 @@ local function menu_uninstall()
 
     if #sel == 0 then p(R.."  Pilihan tidak valid."..NC); return end
 
-    -- Konfirmasi
     divider()
     p(R..B.."  ⚠️  Akan diuninstall:"..NC); p("")
     for _, i in ipairs(sel) do
@@ -364,7 +357,6 @@ local function menu_uninstall()
     local confirm = trim(read_line()):lower(); p("")
     if confirm ~= "y" then p(Y.."  Dibatalkan."..NC); return end
 
-    -- Proses uninstall
     divider()
     local ok_count, fail_count = 0, 0
     local roblox_uninstalled = false
@@ -399,28 +391,28 @@ local function menu_uninstall()
 end
 
 -- ════════════════════════════════════════════════════════════
---   DOWNLOAD & INSTALL (DanzoInstall R2)
+--   DOWNLOAD & INSTALL (V3 Compatible)
 -- ════════════════════════════════════════════════════════════
 local function parse_filelist(str, folder_id)
     local files = {}
     for obj in str:gmatch("{([^{}]+)}") do
         local name = obj:match('"name"%s*:%s*"([^"]+)"')
         if name and name ~= "" then
-            local id    = obj:match('"id"%s*:%s*"([^"]+)"')
-            local r2key = obj:match('"r2Key"%s*:%s*"([^"]+)"')
-            local size  = obj:match('"size"%s*:%s*(%d+)')
-            local szfmt = obj:match('"sizeFormatted"%s*:%s*"([^"]+)"')
+            local id      = obj:match('"id"%s*:%s*"([^"]+)"')
+            local r2key   = obj:match('"r2Key"%s*:%s*"([^"]+)"')
+            local size    = obj:match('"size"%s*:%s*(%d+)')
+            local szfmt   = obj:match('"sizeFormatted"%s*:%s*"([^"]+)"')
+            local dlurl   = obj:match('"downloadUrl"%s*:%s*"([^"]+)"')
             if r2key then r2key = r2key:gsub("\\/", "/") end
-            -- Filter: hanya file yang r2key-nya mengandung folder_id
-            if not folder_id or (r2key and r2key:find(folder_id, 1, true)) then
-                table.insert(files, {
-                    name    = name,
-                    id      = id or "",
-                    r2key   = r2key or "",
-                    size    = tonumber(size) or 0,
-                    sizefmt = szfmt or "",
-                })
-            end
+            if dlurl then dlurl = dlurl:gsub("\\/", "/") end
+            table.insert(files, {
+                name       = name,
+                id         = id or "",
+                r2key      = r2key or "",
+                size       = tonumber(size) or 0,
+                sizefmt    = szfmt or "",
+                downloadUrl = dlurl or "",
+            })
         end
     end
     return files
@@ -429,8 +421,9 @@ end
 local function list_files(folder_id)
     if not folder_id or folder_id == "" then return {} end
     p(B.."[~] Mengambil daftar file..."..NC)
+    -- V3 fix: use folderId param + limit=100
     local resp = exec(string.format(
-        'curl -s -L --max-time 15 "%s/api/files?folder=%s"', BASE_URL, folder_id
+        'curl -s -L --max-time 15 "%s/api/files?folderId=%s&limit=100"', BASE_URL, folder_id
     ))
     if resp:find('"files"') then
         local files = parse_filelist(resp, folder_id)
@@ -448,6 +441,18 @@ local function build_r2_url(r2key)
                              :gsub("%(","%%28"):gsub("%)","%%29")
 end
 
+local function get_download_url(file)
+    -- V3: prefer downloadUrl from API, fallback to R2 URL builder
+    if file.downloadUrl and file.downloadUrl ~= "" then
+        return file.downloadUrl
+    end
+    if file.r2key and file.r2key ~= "" then
+        return build_r2_url(file.r2key)
+    end
+    -- Last resort: use worker stream endpoint
+    return BASE_URL .. "/dl/" .. file.id .. "?stream=1"
+end
+
 local function download_file(file, num, total)
     local safe = file.name:gsub("[/\\:*?\"<>|]", "_")
     local dest = DEST.."/"..safe
@@ -458,7 +463,7 @@ local function download_file(file, num, total)
     p(CY.."        Ukuran : "..file.sizefmt..NC)
     p("")
 
-    local url = build_r2_url(file.r2key)
+    local url = get_download_url(file)
 
     exec_code(string.format(
         'curl -L --progress-bar --max-time 600 -o "%s" "%s" 2>&1 | cat',
@@ -476,7 +481,6 @@ local function download_file(file, num, total)
     end
 end
 
--- ── Cek file lokal di /sdcard/Download ──────────────────────
 local function find_local_apk(filename)
     local safe = filename:gsub("[/\\:*?\"<>|]", "_")
     local path = DEST.."/"..safe
@@ -484,37 +488,85 @@ local function find_local_apk(filename)
     return nil
 end
 
--- ── Pilih Preset Folder ──────────────────────────────────────
+-- ── Fetch Folders dari API ────────────────────────────────────
+local function fetch_folders(force)
+    if CACHED_FOLDERS and not force then return CACHED_FOLDERS end
+    p(B.."[~] Mengambil daftar folder..."..NC)
+    local resp = exec(string.format(
+        'curl -s -L --max-time 15 "%s/api/folders?limit=100&sort=name&order=asc"', BASE_URL
+    ))
+    local folders = {}
+    -- Parse folders array from JSON
+    for obj in resp:gmatch("{([^{}]+)}") do
+        local name = obj:match('"name"%s*:%s*"([^"]+)"')
+        local fid  = obj:match('"id"%s*:%s*"([^"]+)"')
+        local pid  = obj:match('"parentId"%s*:%s*"([^"]*)"')
+        local cnt  = obj:match('"fileCount"%s*:%s*(%d+)')
+        local szf  = obj:match('"totalSizeFormatted"%s*:%s*"([^"]*)"')
+        if name and fid and (not pid or pid == "" or pid == "null") then
+            -- Only root folders (no parentId)
+            table.insert(folders, {
+                name     = name,
+                id       = fid,
+                count    = tonumber(cnt) or 0,
+                sizefmt  = szf or "",
+            })
+        end
+    end
+    if #folders > 0 then
+        p(G.."[✓] Ditemukan "..#folders.." folder."..NC); p("")
+        CACHED_FOLDERS = folders
+        return folders
+    end
+    p(R.."[✗] Gagal ambil folder list."..NC); p("")
+    return {}
+end
+
+-- ── Pilih Folder ─────────────────────────────────────────────
 local function select_preset_folder()
     exec_code("clear 2>/dev/null")
     divider()
     p(B..G.."  📥  Auto Download & Install APK"..NC)
     divider(); p("")
-    p(B.."  Pilih Preset Folder:"..NC); p("")
 
-    local colors = { G, CY, Y, R }
-    for i, preset in ipairs(PRESET_FOLDERS) do
-        local col = colors[i] or NC
-        p(string.format("  %s[%d]%s  %s", col, i, NC, preset.name))
+    local folders = fetch_folders()
+    if #folders == 0 then
+        p(R.."  Tidak ada folder tersedia."..NC); p("")
+        return nil
+    end
+
+    p(B.."  Pilih Folder:"..NC); p("")
+
+    local colors = { G, CY, Y, R, B }
+    for i, f in ipairs(folders) do
+        local col = colors[((i-1) % #colors) + 1] or NC
+        local info = ""
+        if f.count > 0 then info = Y.." ("..f.count.." file"..( f.sizefmt ~= "" and " · "..f.sizefmt or "")..")"..NC end
+        p(string.format("  %s[%d]%s  %s%s", col, i, NC, f.name, info))
     end
     p("")
+    p(string.format("  %s[R]%s  🔄 Refresh folder list", CY, NC))
     p(string.format("  %s[0]%s  ← Kembali ke Menu Utama", B, NC))
     p("")
     divider()
     pr(B.."  Pilihan: "..NC)
     local c = trim(read_line()); p("")
 
-    local idx = tonumber(c)
     if c == "0" then return nil end
-    if idx and PRESET_FOLDERS[idx] then
-        return PRESET_FOLDERS[idx]
+    if c:lower() == "r" then
+        CACHED_FOLDERS = nil
+        return select_preset_folder()
+    end
+
+    local idx = tonumber(c)
+    if idx and folders[idx] then
+        return folders[idx]
     end
     p(R.."  [✗] Pilihan tidak valid."..NC); p("")
     return nil
 end
 
 menu_download = function()
-    -- ── 1. Pilih preset folder ───────────────────────────────
     local preset = select_preset_folder()
     if not preset then return end
 
@@ -523,7 +575,6 @@ menu_download = function()
     divider()
     p(B.."  Folder: "..preset.name..NC); p("")
 
-    -- ── 2. Ambil daftar file dari folder ────────────────────
     local files = list_files(active_folder)
     if #files == 0 then return end
 
@@ -538,12 +589,10 @@ menu_download = function()
         p(""); return
     end
 
-    -- Urutkan A-Z
     table.sort(apk_files, function(a, b)
         return a.name:lower() < b.name:lower()
     end)
 
-    -- ── 3. Tampilkan daftar APK untuk dipilih ───────────────
     divider()
     p(B.."  APK tersedia di "..preset.name..":"..NC); p("")
     for i, f in ipairs(apk_files) do
@@ -569,13 +618,11 @@ menu_download = function()
     local to_process = {}
     for _, i in ipairs(sel) do table.insert(to_process, apk_files[i]) end
 
-    -- ── 4. Deteksi file pilihan yang sudah ada di /sdcard/Download ──
     local already_local = {}
     for _, f in ipairs(to_process) do
         already_local[f.name] = find_local_apk(f.name)
     end
 
-    -- ── 5. Download yang belum ada, skip yang sudah ada ─────
     p(""); divider()
     p(B.."  📥 Proses Download ("..#to_process.." file)..."..NC); p("")
     local dl_paths = {}
@@ -589,16 +636,10 @@ menu_download = function()
             table.insert(dl_paths, lpath)
             skip_count = skip_count + 1
         else
-            local ff = {}
-            for k, v in pairs(f) do ff[k] = v end
-            if ff.r2key == "" then
-                ff.r2key = "folders/"..active_folder.."/"..ff.id.."/"..ff.name
-            end
-            table.insert(dl_paths, download_file(ff, i, #to_process))
+            table.insert(dl_paths, download_file(f, i, #to_process))
         end
     end
 
-    -- ── 6. Install ───────────────────────────────────────────
     divider()
     p(B.."  📲 Install ("..#to_process.." file)..."..NC); p("")
     local ok_count, fail_count = 0, 0
@@ -609,12 +650,10 @@ menu_download = function()
         else        fail_count = fail_count+1; table.insert(statuses, "GAGAL") end
     end
 
-    -- ── 7. Hapus semua file setelah proses selesai ───────────
     for i, _ in ipairs(to_process) do
         if dl_paths[i] then os.remove(dl_paths[i]) end
     end
 
-    -- ── 7. Ringkasan ─────────────────────────────────────────
     divider()
     p(B.."  📊 Ringkasan Install — "..preset.name..":"..NC); p("")
     for i, f in ipairs(to_process) do
@@ -660,7 +699,6 @@ local function menu_webhook()
 
     local webhook_url = load_webhook()
 
-    -- Tampilkan URL tersimpan
     if webhook_url ~= "" then
         p(B.."  Webhook aktif:"..NC)
         p("  "..trunc(webhook_url, 55)); p("")
@@ -676,7 +714,6 @@ local function menu_webhook()
     local c = trim(read_line()); p("")
 
     if c == "2" then
-        -- Setting webhook URL
         divider()
         p(B.."  Masukkan Webhook URL:"..NC); p("")
         pr(B.."  URL: "..NC)
@@ -696,10 +733,9 @@ local function menu_webhook()
         return menu_webhook()
 
     elseif c == "1" then
-        -- Kirim cookie.txt
         divider()
         if webhook_url == "" then
-            p(B.."  [✗] Webhook URL belum diset. Pilih [1] dulu."..NC)
+            p(B.."  [✗] Webhook URL belum diset. Pilih [2] dulu."..NC)
             p(""); pr(B.."  [Enter] lanjut..."..NC); read_line()
             return menu_webhook()
         end
@@ -710,7 +746,6 @@ local function menu_webhook()
             return menu_webhook()
         end
 
-        -- Baca isi cookie.txt per baris
         local lines = {}
         local f = io.open(COOKIE_FILE, "r")
         for line in f:lines() do
@@ -798,26 +833,31 @@ local function main()
     elseif c == "4" then menu_webhook()
     elseif c == "3" then
         divider()
-        p(B.."  Pilih Preset untuk Lihat Daftar File:"..NC); p("")
-        for i, preset in ipairs(PRESET_FOLDERS) do
-            p(string.format("  %s[%d]%s  %s", B, i, NC, preset.name))
-        end
-        p(""); pr(B.."  Pilihan: "..NC)
-        local pc = trim(read_line()); p("")
-        local pidx = tonumber(pc)
-        if pidx and PRESET_FOLDERS[pidx] then
-            local files = list_files(PRESET_FOLDERS[pidx].id)
-            if #files > 0 then
-                table.sort(files, function(a, b) return a.name:lower() < b.name:lower() end)
-                p(B.."  File di "..PRESET_FOLDERS[pidx].name..":"..NC); p("")
-                for i, f in ipairs(files) do
-                    p(string.format("  %s[%2d]%s %-42s %s%s%s",
-                        B, i, NC, trunc(f.name, 42), B, f.sizefmt, NC))
-                end
-                p("")
-            end
+        local folders = fetch_folders()
+        if #folders == 0 then
+            p(R.."  Tidak ada folder."..NC)
         else
-            p(R.."  [✗] Pilihan tidak valid."..NC)
+            p(B.."  Pilih Folder untuk Lihat Daftar File:"..NC); p("")
+            for i, f in ipairs(folders) do
+                p(string.format("  %s[%d]%s  %s", B, i, NC, f.name))
+            end
+            p(""); pr(B.."  Pilihan: "..NC)
+            local pc = trim(read_line()); p("")
+            local pidx = tonumber(pc)
+            if pidx and folders[pidx] then
+                local files = list_files(folders[pidx].id)
+                if #files > 0 then
+                    table.sort(files, function(a, b) return a.name:lower() < b.name:lower() end)
+                    p(B.."  File di "..folders[pidx].name..":"..NC); p("")
+                    for i, f in ipairs(files) do
+                        p(string.format("  %s[%2d]%s %-42s %s%s%s",
+                            B, i, NC, trunc(f.name, 42), B, f.sizefmt, NC))
+                    end
+                    p("")
+                end
+            else
+                p(R.."  [✗] Pilihan tidak valid."..NC)
+            end
         end
     elseif c == "0" then
         p(Y.."\n  Sampai jumpa!\n"..NC); os.exit(0)
