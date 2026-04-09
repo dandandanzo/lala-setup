@@ -423,24 +423,17 @@ local function build_r2_url(r2key)
 end
 
 local function get_download_url(file)
-    -- V3: prefer downloadUrl from API, fallback to R2 URL builder
-    local dl = file.downloadUrl or ""
-    if dl ~= "" then
-        -- Fix: if URL is relative (no host), prepend R2_URL
-        if dl:sub(1,1) == "/" then
-            return R2_URL .. dl
-        end
-        -- If URL already has host, use as-is
-        if dl:match("^https?://") then
-            return dl
-        end
-        -- Bare path without leading slash
-        return R2_URL .. "/" .. dl
+    -- Always use worker stream endpoint — works without R2 public access
+    if file.id and file.id ~= "" then
+        return BASE_URL .. "/dl/" .. file.id .. "?stream=1"
     end
+    -- Fallback: try downloadUrl if it has full host
+    local dl = file.downloadUrl or ""
+    if dl:match("^https?://") then return dl end
+    -- Fallback: R2 URL
     if file.r2key and file.r2key ~= "" then
         return build_r2_url(file.r2key)
     end
-    -- Last resort: use worker stream endpoint
     return BASE_URL .. "/dl/" .. file.id .. "?stream=1"
 end
 
