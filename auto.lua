@@ -424,8 +424,18 @@ end
 
 local function get_download_url(file)
     -- V3: prefer downloadUrl from API, fallback to R2 URL builder
-    if file.downloadUrl and file.downloadUrl ~= "" then
-        return file.downloadUrl
+    local dl = file.downloadUrl or ""
+    if dl ~= "" then
+        -- Fix: if URL is relative (no host), prepend R2_URL
+        if dl:sub(1,1) == "/" then
+            return R2_URL .. dl
+        end
+        -- If URL already has host, use as-is
+        if dl:match("^https?://") then
+            return dl
+        end
+        -- Bare path without leading slash
+        return R2_URL .. "/" .. dl
     end
     if file.r2key and file.r2key ~= "" then
         return build_r2_url(file.r2key)
