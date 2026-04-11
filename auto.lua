@@ -1,11 +1,11 @@
 #!/data/data/com.termux/files/usr/bin/lua
 
-local BASE_URL  = "https://ipantompal.anistioj.workers.dev/"
+local BASE_URL  = "https://ipantompal.anistioj.workers.dev"
 local R2_URL    = "https://pub-ff1d15d748904c1bb178166d90f22db5.r2.dev"
-local TMP_DIR      = os.getenv("HOME") .. "/danzo_tmp"
+local TMP_DIR      = os.getenv("HOME") .. "/ipantompal_tmp"
 local DEST         = "/storage/emulated/0/Download"
 local COOKIE_FILE  = "/storage/emulated/0/Download/cookie.txt"
-local WEBHOOK_CFG  = os.getenv("HOME") .. "/danzo_tmp/webhook.cfg"
+local WEBHOOK_CFG  = os.getenv("HOME") .. "/ipantompal_tmp/webhook.cfg"
 
 -- ── Preset Folders (fetched from API) ────────────────────────
 local CACHED_FOLDERS = nil
@@ -605,6 +605,50 @@ menu_download = function()
     local already_local = {}
     for _, f in ipairs(to_process) do
         already_local[f.name] = find_local_apk(f.name)
+    end
+
+    -- Detect existing Roblox packages
+    local function detect_roblox_packages()
+        local h = io.popen('pm list packages 2>/dev/null | grep -i "com.roblox"')
+        if not h then return {} end
+        local pkgs = {}
+        for line in h:lines() do
+            local pkg = line:match("package:(.+)")
+            if pkg then table.insert(pkgs, pkg) end
+        end
+        h:close()
+        return pkgs
+    end
+
+    local roblox_pkgs = detect_roblox_packages()
+    if #roblox_pkgs > 0 then
+        p(""); divider()
+        p(B.."  ⚠  Roblox terdeteksi terinstall:"..NC); p("")
+        for i, pkg in ipairs(roblox_pkgs) do
+            p(B.."    "..i..". "..NC..pkg)
+        end
+        p("")
+        p(B.."  [1]"..NC.." Uninstall dulu sebelum download")
+        p(B.."  [2]"..NC.." Lanjut download tanpa uninstall")
+        p(B.."  [0]"..NC.." Batal")
+        p("")
+        io.write(B.."  Pilih > "..NC); io.flush()
+        local ch = trim(io.read("*l") or "")
+        if ch == "0" then p(B.."  Dibatalkan."..NC); p(""); os.exit(0) end
+        if ch == "1" then
+            p("")
+            for _, pkg in ipairs(roblox_pkgs) do
+                p(B.."  🗑  Uninstall "..pkg.."..."..NC)
+                local ret = os.execute('pm uninstall '..pkg..' 2>/dev/null')
+                if ret == 0 or ret == true then
+                    p(B.."      [✓] "..pkg.." berhasil diuninstall"..NC)
+                else
+                    p(B.."      [✗] Gagal uninstall "..pkg..NC)
+                end
+            end
+            p("")
+        end
+        -- ch == "2" → lanjut tanpa uninstall
     end
 
     p(""); divider()
