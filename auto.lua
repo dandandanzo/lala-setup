@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/lua
 
-local BASE_URL  = "https://danzoinstall.anistioj.workers.dev"
+local BASE_URL  = "https://ipantompal.anistioj.workers.dev/"
 local R2_URL    = "https://pub-ff1d15d748904c1bb178166d90f22db5.r2.dev"
 local TMP_DIR      = os.getenv("HOME") .. "/danzo_tmp"
 local DEST         = "/storage/emulated/0/Download"
