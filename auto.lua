@@ -607,50 +607,6 @@ menu_download = function()
         already_local[f.name] = find_local_apk(f.name)
     end
 
-    -- Detect existing Roblox packages
-    local function detect_roblox_packages()
-        local h = io.popen('pm list packages 2>/dev/null | grep -i "com.roblox"')
-        if not h then return {} end
-        local pkgs = {}
-        for line in h:lines() do
-            local pkg = line:match("package:(.+)")
-            if pkg then table.insert(pkgs, pkg) end
-        end
-        h:close()
-        return pkgs
-    end
-
-    local roblox_pkgs = detect_roblox_packages()
-    if #roblox_pkgs > 0 then
-        p(""); divider()
-        p(B.."  ⚠  Roblox terdeteksi terinstall:"..NC); p("")
-        for i, pkg in ipairs(roblox_pkgs) do
-            p(B.."    "..i..". "..NC..pkg)
-        end
-        p("")
-        p(B.."  [1]"..NC.." Uninstall dulu sebelum download")
-        p(B.."  [2]"..NC.." Lanjut download tanpa uninstall")
-        p(B.."  [0]"..NC.." Batal")
-        p("")
-        io.write(B.."  Pilih > "..NC); io.flush()
-        local ch = trim(io.read("*l") or "")
-        if ch == "0" then p(B.."  Dibatalkan."..NC); p(""); os.exit(0) end
-        if ch == "1" then
-            p("")
-            for _, pkg in ipairs(roblox_pkgs) do
-                p(B.."  🗑  Uninstall "..pkg.."..."..NC)
-                local ret = os.execute('pm uninstall '..pkg..' 2>/dev/null')
-                if ret == 0 or ret == true then
-                    p(B.."      [✓] "..pkg.." berhasil diuninstall"..NC)
-                else
-                    p(B.."      [✗] Gagal uninstall "..pkg..NC)
-                end
-            end
-            p("")
-        end
-        -- ch == "2" → lanjut tanpa uninstall
-    end
-
     p(""); divider()
     p(B.."  📥 Proses Download ("..#to_process.." file)..."..NC); p("")
     local dl_paths = {}
