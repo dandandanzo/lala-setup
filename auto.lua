@@ -44,6 +44,14 @@ end
 local function file_size(path)
     local h = io.popen("du -h '"..path.."' | cut -f1"); local s = h:read("*l"); h:close(); return s or "?"
 end
+local function file_size_bytes(path)
+    local h = io.popen("stat -c%s '"..path.."' 2>/dev/null || wc -c < '"..path.."' 2>/dev/null")
+    local s = h:read("*l"); h:close(); return tonumber(trim(s)) or 0
+end
+-- Shell-safe quoting: wraps in single quotes, escapes existing single quotes
+local function shell_quote(s)
+    return "'" .. s:gsub("'", "'\\''") .. "'"
+end
 
 -- ── Banner ───────────────────────────────────────────────────
 local function banner()
@@ -135,7 +143,7 @@ end
 
 local function get_download_url(file)
     if file.id and file.id ~= "" then return BASE_URL.."/dl/"..file.id.."?stream=1" end
-    return BASE_URL.."/dl/"..file.id.."?stream=1"
+    return nil -- no valid download URL
 end
 
 local function fetch_folders(force)
@@ -166,7 +174,8 @@ end
 --   DOWNLOAD
 -- ══════════════════════════════════════════════════════════════
 local function download_file(file, num, total)
-    local dest = DEST.."/"..file.name:gsub("[/\\:*?\"<>|]", "_")
+    local safe = file.name:gsub("[/\\:*?\"<>|']", "_")
+    local dest = DEST.."/"..safe
 
     divider()
     p(string.format("  [%d/%d] "..B.."%s"..NC, num, total, trunc(file.name, 36)))
@@ -174,16 +183,22 @@ local function download_file(file, num, total)
     if file.description ~= "" then p(DIM.."        Note : "..trunc(file.description, 40)..NC) end
     p("")
 
-    exec("rm -f '"..dest.."'")
     local url = get_download_url(file)
-    for attempt = 1, 2 do
-        exec_code(string.format('curl -L --progress-bar --max-time 600 -o "%s" "%s" 2>&1 | cat', dest, url))
-        restore_tty(); p("")
-        if file_exists(dest) then
-            p(GR.."        [+] Done — "..file_size(dest)..NC); p(""); return dest
-        end
-        if attempt < 2 then p(YL.."        [!] Retry..."..NC); p("") end
+    if not url then
+        p(RD.."        [!] No download URL available"..NC); p(""); return nil
     end
+
+    exec("rm -f "..shell_quote(dest))
+    exec_code(string.format('curl -L --progress-bar --max-time 600 -o %s %s 2>&1 | cat',
+        shell_quote(dest), shell_quote(url)))
+    restore_tty(); p("")
+
+    -- Check file exists AND has content (> 0 bytes)
+    if file_exists(dest) and file_size_bytes(dest) > 0 then
+        p(GR.."        [+] Done — "..file_size(dest)..NC); p(""); return dest
+    end
+    -- Clean up 0-byte or partial file
+    exec("rm -f "..shell_quote(dest))
     p(RD.."        [!] Download failed!"..NC); p(""); return nil
 end
 
@@ -200,9 +215,10 @@ local function install_apk(filepath, num, total)
     end
     local name = filepath:match("([^/]+)$")
     p(string.format("  [%d/%d] Install "..B.."%s"..NC, num, total, trunc(name, 36)))
-    local out = exec("su -c \"pm install -r '"..filepath.."'\""); restore_tty()
+    local sq = shell_quote(filepath)
+    local out = exec("su -c \"pm install -r "..sq.."\""); restore_tty()
     if out:lower():match("success") then p(GR.."        [+] Success"..NC); p(""); return true end
-    out = exec("su -c \"pm install -r -d '"..filepath.."'\""); restore_tty()
+    out = exec("su -c \"pm install -r -d "..sq.."\""); restore_tty()
     if out:lower():match("success") then p(GR.."        [+] Success"..NC); p(""); return true end
     p(RD.."        [!] Failed: "..(out:match("[^\n]+$") or "?")..NC); p(""); return false
 end
@@ -234,7 +250,13 @@ local function do_uninstall(pkg, label)
     else p(RD.."[!] Failed"..NC); return false end
 end
 
+-- Forward declaration (needed so menu_uninstall can call menu_download)
+local menu_download
+
 local function menu_uninstall()
+    if not HAS_ROOT then
+        divider(); p(RD.."  [!] Root required for uninstall."..NC); divider(); return
+    end
     exec_code("clear 2>/dev/null"); divider(); p(B.."  Uninstall Package"..NC); divider(); p("")
     p(YL.."  Scanning installed packages..."..NC); p("")
     local installed, seen = {}, {}
@@ -260,11 +282,16 @@ local function menu_uninstall()
         p(""); pr(B.."  Choice: "..NC); local si=trim(read_line()); p(""); local sl=parse_selection(si,#pkgs)
         if #sl==0 then p(RD.."  Invalid."..NC); return end; divider()
         local ok,fl=0,0; for _,i in ipairs(sl) do if do_uninstall(pkgs[i],pkgs[i]) then ok=ok+1 else fl=fl+1 end end
-        p(""); p("  Success: "..ok.."  Failed: "..fl); divider(); return
+        p(""); p("  Success: "..ok.."  Failed: "..fl); divider()
+        p(""); p(B.."  Entering Download & Install..."..NC); p("")
+        menu_download(); return
     end
     if input:lower()=="m" then
         pr(B.."  Package ID: "..NC); local pk=trim(read_line()); if pk=="" then return end
-        if not is_installed(pk) then p(YL.."  Not installed: "..pk..NC) else do_uninstall(pk,pk) end; return
+        if not is_installed(pk) then p(YL.."  Not installed: "..pk..NC); return end
+        do_uninstall(pk,pk)
+        p(""); p(B.."  Entering Download & Install..."..NC); p("")
+        menu_download(); return
     end
     if #installed==0 then p(RD.."  Nothing to uninstall."..NC); return end
     local sel=parse_selection(input,#installed); if #sel==0 then p(RD.."  Invalid."..NC); return end
@@ -274,14 +301,16 @@ local function menu_uninstall()
     divider(); local ok,fl=0,0
     for _,i in ipairs(sel) do if do_uninstall(installed[i].pkg,installed[i].name) then ok=ok+1 else fl=fl+1 end end
     p(""); p("  Success: "..ok.."  Failed: "..fl); divider()
+    p(""); p(B.."  Entering Download & Install..."..NC); p("")
+    menu_download()
 end
 
 -- ══════════════════════════════════════════════════════════════
 --   DOWNLOAD & INSTALL MENU
 -- ══════════════════════════════════════════════════════════════
-local menu_download
 
 menu_download = function()
+  while true do
     exec_code("clear 2>/dev/null"); divider(); p(B.."  Download & Install APK"..NC); divider(); p("")
     local folders = fetch_folders()
     if #folders==0 then p(RD.."  No folders available."..NC); return end
@@ -293,73 +322,88 @@ menu_download = function()
     end
     p(""); p("  "..CY.."[R]"..NC.."  Refresh"); p("  "..CY.."[0]"..NC.."  Back"); p(""); divider()
     pr(B.."  Choice: "..NC); local c=trim(read_line()); p("")
+
     if c=="0" then return end
-    if c:lower()=="r" then CACHED_FOLDERS=nil; return menu_download() end
-    local idx=tonumber(c); if not idx or not folders[idx] then p(RD.."  Invalid."..NC); return end
-
-    local preset = folders[idx]
-    local files = list_files(preset.id); if #files==0 then return end
-
-    local apk_files = {}
-    for _,f in ipairs(files) do if f.name:lower():find("%.apk") then apk_files[#apk_files+1]=f end end
-    if #apk_files==0 then
-        p(YL.."  No APK files. Available:"..NC)
-        for _,f in ipairs(files) do p("    - "..f.name.." ("..f.sizefmt..")") end; return
-    end
-    table.sort(apk_files, function(a,b) return a.name:lower()<b.name:lower() end)
-
-    divider(); p(B.."  APK in "..preset.name..":"..NC); p("")
-    for i,f in ipairs(apk_files) do
-        local note = (f.description~="" and ("\n        "..DIM..trunc(f.description,50)..NC) or "")
-        p(string.format("  "..CY.."[%2d]"..NC.." %-36s %s%s", i, trunc(f.name,36), f.sizefmt, note))
-    end
-    p(""); p("  Select APK:  Example: 1 | 1,3 | 2-4 | all")
-    divider(); pr(B.."  Choice: "..NC)
-    local input=trim(read_line()):gsub("\r",""); p("")
-    if input=="0" then return end
-    if input=="" then return menu_download() end
-
-    local to_process = {}
-    local sel=parse_selection(input,#apk_files); if #sel==0 then p(RD.."  Invalid."..NC); return end
-    for _,i in ipairs(sel) do to_process[#to_process+1]=apk_files[i] end
-
-    -- Download
-    p(""); divider(); p(B.."  Downloading "..#to_process.." files..."..NC); p("")
-    local dl_paths = {}
-    for i,f in ipairs(to_process) do
-        dl_paths[i] = download_file(f, i, #to_process)
-    end
-
-    -- Retry failed downloads once
-    local failed = {}
-    for i,f in ipairs(to_process) do if not dl_paths[i] then failed[#failed+1] = i end end
-    if #failed > 0 then
-        divider(); p(YL.."  Retrying "..#failed.." failed downloads..."..NC); p("")
-        for _,i in ipairs(failed) do
-            dl_paths[i] = download_file(to_process[i], i, #to_process)
-        end
-    end
-
-    -- Install
-    if HAS_ROOT then
-        divider(); p(B.."  Installing "..#to_process.." files..."..NC); p("")
-        local ok_n, fail_inst = 0, 0
-        local inst_st = {}
-        for i=1,#to_process do
-            if install_apk(dl_paths[i],i,#to_process) then ok_n=ok_n+1; inst_st[i]="OK" else fail_inst=fail_inst+1; inst_st[i]="FAIL" end
-        end
-        divider(); p(B.."  Summary — "..preset.name..":"..NC); p("")
-        for i,f in ipairs(to_process) do
-            local icon = inst_st[i]=="OK" and (GR.."[+]"..NC) or (RD.."[!]"..NC)
-            p("  "..icon.." "..trunc(f.name,38))
-        end
-        p(""); p("  Installed : "..ok_n); p("  Failed    : "..fail_inst)
+    if c:lower()=="r" then CACHED_FOLDERS=nil -- continues while loop
     else
-        p(GR.."  [+] "..#to_process.." files downloaded to "..DEST..NC)
-        p(YL.."  [!] Manual install required (no root)"..NC)
-    end
-    divider(); p("")
-    os.exit(0)
+        local idx=tonumber(c)
+        if not idx or not folders[idx] then p(RD.."  Invalid."..NC); return end
+        local preset = folders[idx]
+        local files = list_files(preset.id)
+        if #files==0 then return end
+
+        local apk_files = {}
+        for _,f in ipairs(files) do
+            if f.name:lower():find("%.apk") then apk_files[#apk_files+1]=f end
+        end
+        if #apk_files==0 then
+            p(YL.."  No APK files. Available:"..NC)
+            for _,f in ipairs(files) do p("    - "..f.name.." ("..f.sizefmt..")") end
+            return
+        end
+        table.sort(apk_files, function(a,b) return a.name:lower()<b.name:lower() end)
+
+        divider(); p(B.."  APK in "..preset.name..":"..NC); p("")
+        for i,f in ipairs(apk_files) do
+            local note = (f.description~="" and ("\n        "..DIM..trunc(f.description,50)..NC) or "")
+            p(string.format("  "..CY.."[%2d]"..NC.." %-36s %s%s", i, trunc(f.name,36), f.sizefmt, note))
+        end
+        p(""); p("  Select APK:  Example: 1 | 1,3 | 2-4 | all")
+        divider(); pr(B.."  Choice: "..NC)
+        local input=trim(read_line()):gsub("\r",""); p("")
+
+        if input=="0" or input=="" then return end
+
+        local to_process = {}
+        local sel=parse_selection(input,#apk_files)
+        if #sel==0 then p(RD.."  Invalid."..NC); return end
+        for _,i in ipairs(sel) do to_process[#to_process+1]=apk_files[i] end
+
+        -- Download
+        p(""); divider(); p(B.."  Downloading "..#to_process.." files..."..NC); p("")
+        local dl_paths = {}
+        for i,f in ipairs(to_process) do
+            dl_paths[i] = download_file(f, i, #to_process)
+        end
+
+        -- Retry failed downloads once
+        local failed = {}
+        for i=1,#to_process do
+            if not dl_paths[i] then failed[#failed+1] = i end
+        end
+        if #failed > 0 then
+            divider(); p(YL.."  Retrying "..#failed.." failed downloads..."..NC); p("")
+            for _,i in ipairs(failed) do
+                dl_paths[i] = download_file(to_process[i], i, #to_process)
+            end
+        end
+
+        -- Install
+        if HAS_ROOT then
+            divider(); p(B.."  Installing "..#to_process.." files..."..NC); p("")
+            local ok_n, fail_inst = 0, 0
+            local inst_st = {}
+            for i=1,#to_process do
+                if install_apk(dl_paths[i],i,#to_process) then
+                    ok_n=ok_n+1; inst_st[i]="OK"
+                else
+                    fail_inst=fail_inst+1; inst_st[i]="FAIL"
+                end
+            end
+            divider(); p(B.."  Summary — "..preset.name..":"..NC); p("")
+            for i,f in ipairs(to_process) do
+                local icon = inst_st[i]=="OK" and (GR.."[+]"..NC) or (RD.."[!]"..NC)
+                p("  "..icon.." "..trunc(f.name,38))
+            end
+            p(""); p("  Installed : "..ok_n); p("  Failed    : "..fail_inst)
+        else
+            p(GR.."  [+] "..#to_process.." files downloaded to "..DEST..NC)
+            p(YL.."  [!] Manual install required (no root)"..NC)
+        end
+        divider(); p("")
+        os.exit(0)
+    end -- else (not refresh)
+  end -- while
 end
 
 -- ══════════════════════════════════════════════════════════════
@@ -386,19 +430,21 @@ end
 --   MAIN
 -- ══════════════════════════════════════════════════════════════
 local function main()
-    banner()
-    p("  "..CY.."[1]"..NC.."  Download & Install APK")
-    p("  "..CY.."[2]"..NC.."  Uninstall Package")
-    p("  "..CY.."[3]"..NC.."  View File List")
-    p("  "..CY.."[0]"..NC.."  Exit")
-    p(""); divider(); pr(B.."  Choice: "..NC)
-    local c = trim(read_line())
-    if     c=="1" then menu_download()
-    elseif c=="2" then menu_uninstall()
-    elseif c=="3" then menu_view_files()
-    elseif c=="0" then p("\n  Goodbye!\n"); os.exit(0)
-    else p(RD.."  Invalid."..NC) end
-    pr(B.."  [Enter] back to menu..."..NC); read_line(); main()
+    while true do
+        banner()
+        p("  "..CY.."[1]"..NC.."  Download & Install APK")
+        p("  "..CY.."[2]"..NC.."  Uninstall Package")
+        p("  "..CY.."[3]"..NC.."  View File List")
+        p("  "..CY.."[0]"..NC.."  Exit")
+        p(""); divider(); pr(B.."  Choice: "..NC)
+        local c = trim(read_line())
+        if     c=="1" then menu_download()
+        elseif c=="2" then menu_uninstall()
+        elseif c=="3" then menu_view_files()
+        elseif c=="0" then p("\n  Goodbye!\n"); os.exit(0)
+        else p(RD.."  Invalid."..NC) end
+        pr(B.."  [Enter] back to menu..."..NC); read_line()
+    end
 end
 
 ensure_deps()
