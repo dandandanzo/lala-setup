@@ -142,7 +142,10 @@ local function list_files(folder_id)
 end
 
 local function get_download_url(file)
-    if file.id and file.id ~= "" then return BASE_URL.."/dl/"..file.id.."?stream=1" end
+    if file.id and file.id ~= "" and file.name then
+        local safe = file.name:gsub("[^%w%.%-_]", function(c) return string.format("%%%02X", string.byte(c)) end)
+        return BASE_URL.."/dl/"..file.id.."/"..safe
+    end
     return nil -- no valid download URL
 end
 
