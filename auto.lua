@@ -1,11 +1,11 @@
 #!/data/data/com.termux/files/usr/bin/lua
 
-local VERSION      = "3.0"
+local VERSION      = "3.1"
 local BASE_URL     = "https://ipantompal.anistioj.workers.dev"
 local TMP_DIR      = os.getenv("HOME") .. "/ipantompal_tmp"
 local DEST         = "/storage/emulated/0/Download"
 
-local CACHED_FOLDERS = nil
+local CACHED_TREE  = nil  -- all folders flat list (from tree=1)
 
 -- ── Colors ──────────────────────────────────────────────────
 local B  = "\27[1m"
@@ -15,6 +15,7 @@ local GR = "\27[32m"
 local RD = "\27[31m"
 local YL = "\27[33m"
 local CY = "\27[36m"
+local MG = "\27[35m"
 
 -- ── Helpers ─────────────────────────────────────────────────
 local function p(s)  io.write((s or "").."\n"); io.stdout:flush() end
@@ -48,9 +49,19 @@ local function file_size_bytes(path)
     local h = io.popen("stat -c%s '"..path.."' 2>/dev/null || wc -c < '"..path.."' 2>/dev/null")
     local s = h:read("*l"); h:close(); return tonumber(trim(s)) or 0
 end
--- Shell-safe quoting: wraps in single quotes, escapes existing single quotes
 local function shell_quote(s)
     return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+-- ── Expiry badge (colored) ──────────────────────────────────
+local function expiry_tag(days, pinned)
+    if pinned then return MG.."[pinned]"..NC end
+    if not days then return "" end
+    local n = tonumber(days)
+    if not n then return "" end
+    if n <= 3 then return RD.."["..n.."d left]"..NC
+    elseif n <= 7 then return YL.."["..n.."d left]"..NC
+    else return GR.."["..n.."d left]"..NC end
 end
 
 -- ── Banner ───────────────────────────────────────────────────
@@ -110,9 +121,13 @@ local function parse_filelist(str)
             local szf  = obj:match('"sizeFormatted"%s*:%s*"([^"]+)"')
             local tags = obj:match('"tags"%s*:%s*"([^"]*)"')
             local desc = obj:match('"description"%s*:%s*"([^"]*)"')
+            local expd = obj:match('"expiryDays"%s*:%s*(%d+)')
+            local pinn = obj:match('"isPinned"%s*:%s*(%a+)')
             files[#files+1] = {
                 name = name, id = id or "", size = tonumber(size) or 0,
                 sizefmt = szf or "", tags = tags or "", description = desc or "",
+                expiryDays = expd and tonumber(expd) or nil,
+                isPinned = (pinn == "true"),
             }
         end
     end
@@ -126,7 +141,6 @@ local function list_files(folder_id)
     if not resp or resp == "" then
         p(RD.."  [!] No response from server."..NC); p(""); return {}
     end
-    -- Check for error response
     local err = resp:match('"error"%s*:%s*"([^"]+)"')
     if err then
         p(RD.."  [!] API error: "..err..NC); p(""); return {}
@@ -135,7 +149,6 @@ local function list_files(folder_id)
         local files = parse_filelist(resp)
         if #files > 0 then p(GR.."  [+] Found "..#files.." files."..NC); p(""); return files end
     end
-    -- Debug: show first 200 chars of response
     p(RD.."  [!] Failed to fetch file list."..NC)
     p(DIM.."      Response: "..trunc(resp, 200)..NC)
     p(""); return {}
@@ -146,13 +159,14 @@ local function get_download_url(file)
         local safe = file.name:gsub("[^%w%.%-_]", function(c) return string.format("%%%02X", string.byte(c)) end)
         return BASE_URL.."/dl/"..file.id.."/"..safe
     end
-    return nil -- no valid download URL
+    return nil
 end
 
-local function fetch_folders(force)
-    if CACHED_FOLDERS and not force then return CACHED_FOLDERS end
-    p(B.."[~] Fetching folder list..."..NC)
-    local resp = exec(string.format('curl -s -L --max-time 15 "%s/api/folders?limit=100&sort=name&order=asc"', BASE_URL))
+-- ── Folder tree (single request) ─────────────────────────────
+local function fetch_folder_tree(force)
+    if CACHED_TREE and not force then return CACHED_TREE end
+    p(B.."[~] Fetching folder tree..."..NC)
+    local resp = exec(string.format('curl -s -L --max-time 15 "%s/api/folders?tree=1"', BASE_URL))
     if not resp or resp == "" then
         p(RD.."  [!] No response from server."..NC); p(""); return {}
     end
@@ -163,14 +177,64 @@ local function fetch_folders(force)
         local pid  = obj:match('"parentId"%s*:%s*"([^"]*)"')
         local cnt  = obj:match('"fileCount"%s*:%s*(%d+)')
         local szf  = obj:match('"totalSizeFormatted"%s*:%s*"([^"]*)"')
-        if name and fid and (not pid or pid=="" or pid=="null") then
-            folders[#folders+1] = { name=name, id=fid, count=tonumber(cnt) or 0, sizefmt=szf or "" }
+        if name and fid then
+            -- Normalize parentId: treat "", "null", nil as nil
+            local parent = pid
+            if not parent or parent == "" or parent == "null" then parent = nil end
+            folders[#folders+1] = {
+                name=name, id=fid, parentId=parent,
+                count=tonumber(cnt) or 0, sizefmt=szf or ""
+            }
         end
     end
-    if #folders > 0 then p(GR.."  [+] Found "..#folders.." folders."..NC); p(""); CACHED_FOLDERS=folders; return folders end
+    if #folders > 0 then
+        p(GR.."  [+] Found "..#folders.." folders."..NC); p("")
+        CACHED_TREE = folders; return folders
+    end
     p(RD.."  [!] Failed to fetch folder list."..NC)
     p(DIM.."      Response: "..trunc(resp, 200)..NC)
     p(""); return {}
+end
+
+-- Get children of a parent folder (nil = root)
+local function get_children(all_folders, parent_id)
+    local children = {}
+    for _, f in ipairs(all_folders) do
+        if f.parentId == parent_id then
+            children[#children+1] = f
+        end
+    end
+    table.sort(children, function(a,b) return a.name:lower() < b.name:lower() end)
+    return children
+end
+
+-- Count subfolders for a given folder
+local function count_subfolders(all_folders, folder_id)
+    local n = 0
+    for _, f in ipairs(all_folders) do
+        if f.parentId == folder_id then n = n + 1 end
+    end
+    return n
+end
+
+-- Build breadcrumb path string
+local function build_breadcrumb(all_folders, folder_id)
+    local parts = {}
+    local cur = folder_id
+    while cur do
+        local found = false
+        for _, f in ipairs(all_folders) do
+            if f.id == cur then
+                table.insert(parts, 1, f.name)
+                cur = f.parentId
+                found = true
+                break
+            end
+        end
+        if not found then break end
+    end
+    if #parts == 0 then return "Root" end
+    return "Root > " .. table.concat(parts, " > ")
 end
 
 -- ══════════════════════════════════════════════════════════════
@@ -184,6 +248,8 @@ local function download_file(file, num, total)
     p(string.format("  [%d/%d] "..B.."%s"..NC, num, total, trunc(file.name, 36)))
     p(CY.."        Size : "..file.sizefmt..NC)
     if file.description ~= "" then p(DIM.."        Note : "..trunc(file.description, 40)..NC) end
+    local et = expiry_tag(file.expiryDays, file.isPinned)
+    if et ~= "" then p("        Expiry: "..et) end
     p("")
 
     local url = get_download_url(file)
@@ -196,11 +262,9 @@ local function download_file(file, num, total)
         shell_quote(dest), shell_quote(url)))
     restore_tty(); p("")
 
-    -- Check file exists AND has content (> 0 bytes)
     if file_exists(dest) and file_size_bytes(dest) > 0 then
         p(GR.."        [+] Done — "..file_size(dest)..NC); p(""); return dest
     end
-    -- Clean up 0-byte or partial file
     exec("rm -f "..shell_quote(dest))
     p(RD.."        [!] Download failed!"..NC); p(""); return nil
 end
@@ -244,7 +308,7 @@ local KNOWN_PACKAGES = {
 }
 
 local function is_installed(pkg) local o=exec("su -c \"pm list packages "..pkg.."\""); restore_tty(); return o:match("package:"..pkg:gsub("%-","%%%-")) ~= nil end
-local function scan_by_keyword(kw) local o=exec("su -c \"pm list packages "..kw.."\""); restore_tty(); local r={}; for p in o:gmatch("package:([%w%.%-%_]+)") do r[#r+1]=p end; return r end
+local function scan_by_keyword(kw) local o=exec("su -c \"pm list packages "..kw.."\""); restore_tty(); local r={}; for pk in o:gmatch("package:([%w%.%-%_]+)") do r[#r+1]=pk end; return r end
 
 local function do_uninstall(pkg, label)
     pr("  Removing "..B..label..NC.." ("..pkg..")... ")
@@ -253,7 +317,7 @@ local function do_uninstall(pkg, label)
     else p(RD.."[!] Failed"..NC); return false end
 end
 
--- Forward declaration (needed so menu_uninstall can call menu_download)
+-- Forward declaration
 local menu_download
 
 local function menu_uninstall()
@@ -309,123 +373,242 @@ local function menu_uninstall()
 end
 
 -- ══════════════════════════════════════════════════════════════
+--   FOLDER BROWSER (supports subfolders)
+-- ══════════════════════════════════════════════════════════════
+local function browse_folders(purpose)
+    -- purpose: "download" or "view"
+    local all_folders = fetch_folder_tree()
+    if #all_folders == 0 then p(RD.."  No folders available."..NC); return nil end
+
+    local current_parent = nil  -- nil = root level
+
+    while true do
+        local crumb = build_breadcrumb(all_folders, current_parent)
+        local children = get_children(all_folders, current_parent)
+
+        exec_code("clear 2>/dev/null"); divider()
+        p(B.."  "..(purpose=="download" and "Download & Install APK" or "View File List")..NC)
+        divider()
+        p(DIM.."  "..crumb..NC); p("")
+
+        if #children == 0 and current_parent then
+            -- No subfolders in this folder — return this folder for file listing
+            return current_parent
+        end
+
+        p(B.."  Select Folder:"..NC); p("")
+        for i, f in ipairs(children) do
+            local info_parts = {}
+            if f.count > 0 then info_parts[#info_parts+1] = f.count.." files" end
+            if f.sizefmt ~= "" and f.sizefmt ~= "0 B" then info_parts[#info_parts+1] = f.sizefmt end
+            local subs = count_subfolders(all_folders, f.id)
+            if subs > 0 then info_parts[#info_parts+1] = subs.." subfolder" end
+            local info = #info_parts > 0 and (DIM.." ("..table.concat(info_parts, " / ")..")"..NC) or ""
+            local arrow = subs > 0 and (CY.." >"..NC) or ""
+            p(string.format("  "..CY.."[%d]"..NC.."  %s%s%s", i, f.name, info, arrow))
+        end
+
+        p("")
+        if current_parent then
+            p("  "..CY.."[B]"..NC.."  Back to parent")
+        end
+        p("  "..CY.."[R]"..NC.."  Refresh")
+        p("  "..CY.."[0]"..NC.."  Cancel")
+        p(""); divider(); pr(B.."  Choice: "..NC)
+        local c = trim(read_line()); p("")
+
+        if c == "0" then return nil end
+        if c:lower() == "r" then CACHED_TREE = nil; all_folders = fetch_folder_tree()
+        elseif c:lower() == "b" and current_parent then
+            -- Go back to parent
+            for _, f in ipairs(all_folders) do
+                if f.id == current_parent then
+                    current_parent = f.parentId
+                    break
+                end
+            end
+        else
+            local idx = tonumber(c)
+            if idx and children[idx] then
+                local selected = children[idx]
+                local subs = count_subfolders(all_folders, selected.id)
+                if subs > 0 then
+                    -- Has subfolders — dive into it, but also offer "files in this folder"
+                    exec_code("clear 2>/dev/null"); divider()
+                    p(B.."  "..selected.name..NC)
+                    divider(); p("")
+                    p("  "..CY.."[1]"..NC.."  Browse subfolders ("..subs..")")
+                    if selected.count > 0 then
+                        p("  "..CY.."[2]"..NC.."  Show files in this folder ("..selected.count..")")
+                    end
+                    p("  "..CY.."[0]"..NC.."  Back")
+                    p(""); pr(B.."  Choice: "..NC)
+                    local sc = trim(read_line()); p("")
+                    if sc == "1" then
+                        current_parent = selected.id
+                    elseif sc == "2" and selected.count > 0 then
+                        return selected.id
+                    end
+                else
+                    -- Leaf folder — return directly
+                    return selected.id
+                end
+            else
+                p(RD.."  Invalid choice."..NC)
+                pr(B.."  [Enter]..."..NC); read_line()
+            end
+        end
+    end
+end
+
+-- Get folder name by id
+local function folder_name_by_id(folder_id)
+    if not CACHED_TREE then return folder_id end
+    for _, f in ipairs(CACHED_TREE) do
+        if f.id == folder_id then return f.name end
+    end
+    return folder_id
+end
+
+-- ══════════════════════════════════════════════════════════════
 --   DOWNLOAD & INSTALL MENU
 -- ══════════════════════════════════════════════════════════════
 
 menu_download = function()
-  while true do
-    exec_code("clear 2>/dev/null"); divider(); p(B.."  Download & Install APK"..NC); divider(); p("")
-    local folders = fetch_folders()
-    if #folders==0 then p(RD.."  No folders available."..NC); return end
+    local folder_id = browse_folders("download")
+    if not folder_id then return end
 
-    p(B.."  Select Folder:"..NC); p("")
-    for i,f in ipairs(folders) do
-        local info = f.count>0 and (DIM.." ("..f.count.." files"..(f.sizefmt~="" and " / "..f.sizefmt or "")..")"..NC) or ""
-        p(string.format("  "..CY.."[%d]"..NC.."  %s%s", i, f.name, info))
+    local folder_name = folder_name_by_id(folder_id)
+    local files = list_files(folder_id)
+    if #files == 0 then return end
+
+    -- Check for expiring files and warn
+    local expiring = 0
+    for _, f in ipairs(files) do
+        if f.expiryDays and f.expiryDays <= 3 and not f.isPinned then expiring = expiring + 1 end
     end
-    p(""); p("  "..CY.."[R]"..NC.."  Refresh"); p("  "..CY.."[0]"..NC.."  Back"); p(""); divider()
-    pr(B.."  Choice: "..NC); local c=trim(read_line()); p("")
+    if expiring > 0 then
+        p(RD..B.."  ⚠ "..expiring.." file akan expire dalam 3 hari!"..NC); p("")
+    end
 
-    if c=="0" then return end
-    if c:lower()=="r" then CACHED_FOLDERS=nil -- continues while loop
-    else
-        local idx=tonumber(c)
-        if not idx or not folders[idx] then p(RD.."  Invalid."..NC); return end
-        local preset = folders[idx]
-        local files = list_files(preset.id)
-        if #files==0 then return end
-
-        local apk_files = {}
-        for _,f in ipairs(files) do
-            if f.name:lower():find("%.apk") then apk_files[#apk_files+1]=f end
+    local apk_files = {}
+    for _, f in ipairs(files) do
+        if f.name:lower():find("%.apk") then apk_files[#apk_files+1] = f end
+    end
+    if #apk_files == 0 then
+        p(YL.."  No APK files. Available:"..NC)
+        for _, f in ipairs(files) do
+            local et = expiry_tag(f.expiryDays, f.isPinned)
+            p("    - "..f.name.." ("..f.sizefmt..") "..et)
         end
-        if #apk_files==0 then
-            p(YL.."  No APK files. Available:"..NC)
-            for _,f in ipairs(files) do p("    - "..f.name.." ("..f.sizefmt..")") end
-            return
+        return
+    end
+    table.sort(apk_files, function(a,b) return a.name:lower()<b.name:lower() end)
+
+    divider(); p(B.."  APK in "..folder_name..":"..NC); p("")
+    for i, f in ipairs(apk_files) do
+        local et = expiry_tag(f.expiryDays, f.isPinned)
+        local note = (f.description~="" and ("\n        "..DIM..trunc(f.description,50)..NC) or "")
+        p(string.format("  "..CY.."[%2d]"..NC.." %-32s %6s %s%s", i, trunc(f.name,32), f.sizefmt, et, note))
+    end
+    p(""); p("  Select APK:  Example: 1 | 1,3 | 2-4 | all")
+    divider(); pr(B.."  Choice: "..NC)
+    local input=trim(read_line()):gsub("\r",""); p("")
+
+    if input=="0" or input=="" then return end
+
+    local to_process = {}
+    local sel=parse_selection(input,#apk_files)
+    if #sel==0 then p(RD.."  Invalid."..NC); return end
+    for _,i in ipairs(sel) do to_process[#to_process+1]=apk_files[i] end
+
+    -- Warn if any selected file is about to expire
+    local warn_files = {}
+    for _, f in ipairs(to_process) do
+        if f.expiryDays and f.expiryDays <= 3 and not f.isPinned then
+            warn_files[#warn_files+1] = f.name.." ("..f.expiryDays.."d left)"
         end
-        table.sort(apk_files, function(a,b) return a.name:lower()<b.name:lower() end)
+    end
+    if #warn_files > 0 then
+        p(YL.."  ⚠ File berikut hampir expire:"..NC)
+        for _, w in ipairs(warn_files) do p(RD.."    - "..w..NC) end
+        p(YL.."  Download akan reset timer expiry."..NC); p("")
+    end
 
-        divider(); p(B.."  APK in "..preset.name..":"..NC); p("")
-        for i,f in ipairs(apk_files) do
-            local note = (f.description~="" and ("\n        "..DIM..trunc(f.description,50)..NC) or "")
-            p(string.format("  "..CY.."[%2d]"..NC.." %-36s %s%s", i, trunc(f.name,36), f.sizefmt, note))
+    -- Download
+    p(""); divider(); p(B.."  Downloading "..#to_process.." files..."..NC); p("")
+    local dl_paths = {}
+    for i,f in ipairs(to_process) do
+        dl_paths[i] = download_file(f, i, #to_process)
+    end
+
+    -- Retry failed downloads once
+    local failed = {}
+    for i=1,#to_process do
+        if not dl_paths[i] then failed[#failed+1] = i end
+    end
+    if #failed > 0 then
+        divider(); p(YL.."  Retrying "..#failed.." failed downloads..."..NC); p("")
+        for _,i in ipairs(failed) do
+            dl_paths[i] = download_file(to_process[i], i, #to_process)
         end
-        p(""); p("  Select APK:  Example: 1 | 1,3 | 2-4 | all")
-        divider(); pr(B.."  Choice: "..NC)
-        local input=trim(read_line()):gsub("\r",""); p("")
+    end
 
-        if input=="0" or input=="" then return end
-
-        local to_process = {}
-        local sel=parse_selection(input,#apk_files)
-        if #sel==0 then p(RD.."  Invalid."..NC); return end
-        for _,i in ipairs(sel) do to_process[#to_process+1]=apk_files[i] end
-
-        -- Download
-        p(""); divider(); p(B.."  Downloading "..#to_process.." files..."..NC); p("")
-        local dl_paths = {}
-        for i,f in ipairs(to_process) do
-            dl_paths[i] = download_file(f, i, #to_process)
-        end
-
-        -- Retry failed downloads once
-        local failed = {}
+    -- Install
+    if HAS_ROOT then
+        divider(); p(B.."  Installing "..#to_process.." files..."..NC); p("")
+        local ok_n, fail_inst = 0, 0
+        local inst_st = {}
         for i=1,#to_process do
-            if not dl_paths[i] then failed[#failed+1] = i end
-        end
-        if #failed > 0 then
-            divider(); p(YL.."  Retrying "..#failed.." failed downloads..."..NC); p("")
-            for _,i in ipairs(failed) do
-                dl_paths[i] = download_file(to_process[i], i, #to_process)
+            if install_apk(dl_paths[i],i,#to_process) then
+                ok_n=ok_n+1; inst_st[i]="OK"
+            else
+                fail_inst=fail_inst+1; inst_st[i]="FAIL"
             end
         end
-
-        -- Install
-        if HAS_ROOT then
-            divider(); p(B.."  Installing "..#to_process.." files..."..NC); p("")
-            local ok_n, fail_inst = 0, 0
-            local inst_st = {}
-            for i=1,#to_process do
-                if install_apk(dl_paths[i],i,#to_process) then
-                    ok_n=ok_n+1; inst_st[i]="OK"
-                else
-                    fail_inst=fail_inst+1; inst_st[i]="FAIL"
-                end
-            end
-            divider(); p(B.."  Summary — "..preset.name..":"..NC); p("")
-            for i,f in ipairs(to_process) do
-                local icon = inst_st[i]=="OK" and (GR.."[+]"..NC) or (RD.."[!]"..NC)
-                p("  "..icon.." "..trunc(f.name,38))
-            end
-            p(""); p("  Installed : "..ok_n); p("  Failed    : "..fail_inst)
-        else
-            p(GR.."  [+] "..#to_process.." files downloaded to "..DEST..NC)
-            p(YL.."  [!] Manual install required (no root)"..NC)
+        divider(); p(B.."  Summary — "..folder_name..":"..NC); p("")
+        for i,f in ipairs(to_process) do
+            local icon = inst_st[i]=="OK" and (GR.."[+]"..NC) or (RD.."[!]"..NC)
+            p("  "..icon.." "..trunc(f.name,38))
         end
-        divider(); p("")
-        os.exit(0)
-    end -- else (not refresh)
-  end -- while
+        p(""); p("  Installed : "..ok_n); p("  Failed    : "..fail_inst)
+    else
+        p(GR.."  [+] "..#to_process.." files downloaded to "..DEST..NC)
+        p(YL.."  [!] Manual install required (no root)"..NC)
+    end
+    divider(); p("")
+    p(GR..B.."  Done! Script terminated."..NC); p("")
+    os.exit(0)
 end
 
 -- ══════════════════════════════════════════════════════════════
 --   VIEW FILES
 -- ══════════════════════════════════════════════════════════════
 local function menu_view_files()
-    exec_code("clear 2>/dev/null"); divider(); p(B.."  View File List"..NC); divider(); p("")
-    local folders=fetch_folders(); if #folders==0 then p(RD.."  No folders."..NC); return end
-    for i,f in ipairs(folders) do p(string.format("  "..CY.."[%d]"..NC.."  %s",i,f.name)) end
-    p("  "..CY.."[0]"..NC.."  Back"); p(""); pr(B.."  Choice: "..NC)
-    local pc=trim(read_line()); p(""); if pc=="0" then return end
-    local pidx=tonumber(pc); if not pidx or not folders[pidx] then p(RD.."  Invalid."..NC); return end
-    local files=list_files(folders[pidx].id); if #files==0 then return end
+    local folder_id = browse_folders("view")
+    if not folder_id then return end
+
+    local folder_name = folder_name_by_id(folder_id)
+    local files = list_files(folder_id)
+    if #files == 0 then return end
+
     table.sort(files, function(a,b) return a.name:lower()<b.name:lower() end)
-    divider(); p(B.."  Files in "..folders[pidx].name..":"..NC); p("")
-    for i,f in ipairs(files) do
+
+    -- Count expiring
+    local expiring = 0
+    for _, f in ipairs(files) do
+        if f.expiryDays and f.expiryDays <= 7 and not f.isPinned then expiring = expiring + 1 end
+    end
+
+    divider(); p(B.."  Files in "..folder_name..":"..NC); p("")
+    if expiring > 0 then
+        p(YL.."  ⚠ "..expiring.." file akan expire dalam 7 hari"..NC); p("")
+    end
+    for i, f in ipairs(files) do
         local tag = (f.tags~="" and " ["..f.tags.."]" or "")
+        local et = expiry_tag(f.expiryDays, f.isPinned)
         local note = (f.description~="" and ("\n        "..DIM..trunc(f.description,50)..NC) or "")
-        p(string.format("  "..CY.."[%2d]"..NC.." %-36s %s%s%s", i, trunc(f.name,36), f.sizefmt, tag, note))
+        p(string.format("  "..CY.."[%2d]"..NC.." %-32s %6s %s%s%s", i, trunc(f.name,32), f.sizefmt, et, tag, note))
     end; p("")
 end
 
