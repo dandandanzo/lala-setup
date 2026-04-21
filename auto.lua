@@ -1,11 +1,12 @@
 #!/data/data/com.termux/files/usr/bin/lua
 
-local VERSION      = "3.1"
+local VERSION      = "3.2"
 local BASE_URL     = "https://ipantompal.anistioj.workers.dev"
 local TMP_DIR      = os.getenv("HOME") .. "/ipantompal_tmp"
 local DEST         = "/storage/emulated/0/Download"
 
 local CACHED_TREE  = nil  -- all folders flat list (from tree=1)
+local FILES_CACHE  = {}   -- folder_id → files (avoids re-fetch on back-navigation)
 
 -- ── Colors ──────────────────────────────────────────────────
 local B  = "\27[1m"
@@ -134,24 +135,30 @@ local function parse_filelist(str)
     return files
 end
 
-local function list_files(folder_id)
+local function list_files(folder_id, silent)
     if not folder_id or folder_id == "" then return {} end
-    p(B.."[~] Fetching file list..."..NC)
+    if FILES_CACHE[folder_id] then return FILES_CACHE[folder_id] end
+    if not silent then p(B.."[~] Fetching file list..."..NC) end
     local resp = exec(string.format('curl -s -L --max-time 15 "%s/api/files?folderId=%s&limit=100"', BASE_URL, folder_id))
     if not resp or resp == "" then
-        p(RD.."  [!] No response from server."..NC); p(""); return {}
+        if not silent then p(RD.."  [!] No response from server."..NC); p("") end
+        return {}
     end
     local err = resp:match('"error"%s*:%s*"([^"]+)"')
     if err then
-        p(RD.."  [!] API error: "..err..NC); p(""); return {}
+        if not silent then p(RD.."  [!] API error: "..err..NC); p("") end
+        return {}
     end
     if resp:find('"files"') then
         local files = parse_filelist(resp)
-        if #files > 0 then p(GR.."  [+] Found "..#files.." files."..NC); p(""); return files end
+        FILES_CACHE[folder_id] = files
+        return files
     end
-    p(RD.."  [!] Failed to fetch file list."..NC)
-    p(DIM.."      Response: "..trunc(resp, 200)..NC)
-    p(""); return {}
+    if not silent then
+        p(RD.."  [!] Failed to fetch file list."..NC)
+        p(DIM.."      Response: "..trunc(resp, 200)..NC); p("")
+    end
+    return {}
 end
 
 local function get_download_url(file)
@@ -235,6 +242,16 @@ local function build_breadcrumb(all_folders, folder_id)
     end
     if #parts == 0 then return "Root" end
     return "Root > " .. table.concat(parts, " > ")
+end
+
+-- Get folder name by id
+local function folder_name_by_id(folder_id)
+    if not folder_id then return "Root" end
+    if not CACHED_TREE then return folder_id end
+    for _, f in ipairs(CACHED_TREE) do
+        if f.id == folder_id then return f.name end
+    end
+    return folder_id
 end
 
 -- ══════════════════════════════════════════════════════════════
@@ -373,101 +390,148 @@ local function menu_uninstall()
 end
 
 -- ══════════════════════════════════════════════════════════════
---   FOLDER BROWSER (supports subfolders)
+--   UNIFIED FOLDER + FILE BROWSER (v3.2)
+--   Shows subfolders AND files in the same numbered list.
+--   Returns:
+--     nil                                    = cancelled
+--     { folder_id, files = {f1, f2, ...} }   = user picked files to process
 -- ══════════════════════════════════════════════════════════════
+local function filter_for_purpose(files, purpose)
+    if purpose ~= "download" then return files end
+    local out = {}
+    for _, f in ipairs(files) do
+        if f.name:lower():find("%.apk$") or f.name:lower():find("%.apks$")
+        or f.name:lower():find("%.xapk$") or f.name:lower():find("%.aab$") then
+            out[#out+1] = f
+        end
+    end
+    return out
+end
+
 local function browse_folders(purpose)
-    -- purpose: "download" or "view"
+    -- purpose: "download" (filter to APK) or "view" (all files)
     local all_folders = fetch_folder_tree()
     if #all_folders == 0 then p(RD.."  No folders available."..NC); return nil end
 
     local current_parent = nil  -- nil = root level
+    local pending_msg = nil     -- deferred message shown on next render
 
     while true do
         local crumb = build_breadcrumb(all_folders, current_parent)
         local children = get_children(all_folders, current_parent)
 
+        -- Files in current folder (if any)
+        local files = {}
+        if current_parent then
+            files = list_files(current_parent, true) or {}
+            files = filter_for_purpose(files, purpose)
+            table.sort(files, function(a,b) return a.name:lower() < b.name:lower() end)
+        end
+
+        -- Unified list: subfolders first, then files
+        local items = {}
+        for _, f in ipairs(children) do items[#items+1] = { kind="folder", data=f } end
+        for _, f in ipairs(files)    do items[#items+1] = { kind="file",   data=f } end
+
         exec_code("clear 2>/dev/null"); divider()
-        p(B.."  "..(purpose=="download" and "Download & Install APK" or "View File List")..NC)
+        p(B.."  "..(purpose=="download" and "Download & Install APK" or "View Files")..NC)
         divider()
         p(DIM.."  "..crumb..NC); p("")
 
-        if #children == 0 and current_parent then
-            -- No subfolders in this folder — return this folder for file listing
-            return current_parent
+        if pending_msg then p(pending_msg); p(""); pending_msg = nil end
+
+        if #items == 0 then
+            if purpose == "download" and current_parent then
+                p(YL.."  No APK in this folder."..NC)
+            else
+                p(YL.."  Folder is empty."..NC)
+            end
+            p("")
+        else
+            p(B.."  Pilih:"..NC); p("")
+            for i, item in ipairs(items) do
+                if item.kind == "folder" then
+                    local f = item.data
+                    local subs = count_subfolders(all_folders, f.id)
+                    local info_parts = {}
+                    if f.count > 0 then info_parts[#info_parts+1] = f.count.." files" end
+                    if f.sizefmt ~= "" and f.sizefmt ~= "0 B" then info_parts[#info_parts+1] = f.sizefmt end
+                    if subs > 0 then info_parts[#info_parts+1] = subs.." sub" end
+                    local info = #info_parts > 0 and (DIM.." ("..table.concat(info_parts, " / ")..")"..NC) or ""
+                    local arrow = subs > 0 and (CY.." >"..NC) or ""
+                    p(string.format("  "..CY.."[%2d]"..NC.." 📁 %s%s%s", i, f.name, info, arrow))
+                else
+                    local f = item.data
+                    local et = expiry_tag(f.expiryDays, f.isPinned)
+                    local note = (f.description~="" and ("\n         "..DIM..trunc(f.description,48)..NC) or "")
+                    p(string.format("  "..CY.."[%2d]"..NC.." %-32s %6s %s%s",
+                        i, trunc(f.name, 32), f.sizefmt, et, note))
+                end
+            end
+            p("")
         end
 
-        p(B.."  Select Folder:"..NC); p("")
-        for i, f in ipairs(children) do
-            local info_parts = {}
-            if f.count > 0 then info_parts[#info_parts+1] = f.count.." files" end
-            if f.sizefmt ~= "" and f.sizefmt ~= "0 B" then info_parts[#info_parts+1] = f.sizefmt end
-            local subs = count_subfolders(all_folders, f.id)
-            if subs > 0 then info_parts[#info_parts+1] = subs.." subfolder" end
-            local info = #info_parts > 0 and (DIM.." ("..table.concat(info_parts, " / ")..")"..NC) or ""
-            local arrow = subs > 0 and (CY.." >"..NC) or ""
-            p(string.format("  "..CY.."[%d]"..NC.."  %s%s%s", i, f.name, info, arrow))
-        end
-
-        p("")
-        if current_parent then
-            p("  "..CY.."[B]"..NC.."  Back to parent")
-        end
+        if current_parent then p("  "..CY.."[B]"..NC.."  Back to parent") end
         p("  "..CY.."[R]"..NC.."  Refresh")
         p("  "..CY.."[0]"..NC.."  Cancel")
+        if #files > 0 then
+            p("")
+            p(DIM.."  Pilih file: 1 | 1,3 | 2-4 | all "..
+              "(folder pilih satu angka untuk masuk)"..NC)
+        end
         p(""); divider(); pr(B.."  Choice: "..NC)
         local c = trim(read_line()); p("")
 
         if c == "0" then return nil end
-        if c:lower() == "r" then CACHED_TREE = nil; all_folders = fetch_folder_tree()
-        elseif c:lower() == "b" and current_parent then
-            -- Go back to parent
-            for _, f in ipairs(all_folders) do
-                if f.id == current_parent then
-                    current_parent = f.parentId
-                    break
-                end
+
+        if c:lower() == "r" then
+            CACHED_TREE = nil
+            FILES_CACHE = {}
+            all_folders = fetch_folder_tree()
+            if current_parent then
+                -- make sure current_parent still exists after refresh
+                local still = false
+                for _, f in ipairs(all_folders) do if f.id == current_parent then still = true; break end end
+                if not still then current_parent = nil end
             end
+
+        elseif c:lower() == "b" and current_parent then
+            for _, f in ipairs(all_folders) do
+                if f.id == current_parent then current_parent = f.parentId; break end
+            end
+
         else
-            local idx = tonumber(c)
-            if idx and children[idx] then
-                local selected = children[idx]
-                local subs = count_subfolders(all_folders, selected.id)
-                if subs > 0 then
-                    -- Has subfolders — dive into it, but also offer "files in this folder"
-                    exec_code("clear 2>/dev/null"); divider()
-                    p(B.."  "..selected.name..NC)
-                    divider(); p("")
-                    p("  "..CY.."[1]"..NC.."  Browse subfolders ("..subs..")")
-                    if selected.count > 0 then
-                        p("  "..CY.."[2]"..NC.."  Show files in this folder ("..selected.count..")")
-                    end
-                    p("  "..CY.."[0]"..NC.."  Back")
-                    p(""); pr(B.."  Choice: "..NC)
-                    local sc = trim(read_line()); p("")
-                    if sc == "1" then
-                        current_parent = selected.id
-                    elseif sc == "2" and selected.count > 0 then
-                        return selected.id
-                    end
-                else
-                    -- Leaf folder — return directly
-                    return selected.id
-                end
+            local sel = parse_selection(c, #items)
+            if #sel == 0 then
+                pending_msg = RD.."  Invalid choice."..NC
+
+            elseif #sel == 1 and items[sel[1]].kind == "folder" then
+                -- Single folder picked → navigate into it
+                current_parent = items[sel[1]].data.id
+
             else
-                p(RD.."  Invalid choice."..NC)
-                pr(B.."  [Enter]..."..NC); read_line()
+                -- Selection contains files (possibly mixed with folders).
+                -- Filter out folders silently and proceed with file(s).
+                local picked_files = {}
+                local skipped_folders = 0
+                for _, idx in ipairs(sel) do
+                    if items[idx].kind == "file" then
+                        picked_files[#picked_files+1] = items[idx].data
+                    else
+                        skipped_folders = skipped_folders + 1
+                    end
+                end
+                if #picked_files == 0 then
+                    pending_msg = RD.."  Pilih 1 folder untuk masuk, atau pilih file."..NC
+                else
+                    if skipped_folders > 0 then
+                        p(YL.."  ("..skipped_folders.." folder di-skip dari seleksi)"..NC)
+                    end
+                    return { folder_id = current_parent, files = picked_files }
+                end
             end
         end
     end
-end
-
--- Get folder name by id
-local function folder_name_by_id(folder_id)
-    if not CACHED_TREE then return folder_id end
-    for _, f in ipairs(CACHED_TREE) do
-        if f.id == folder_id then return f.name end
-    end
-    return folder_id
 end
 
 -- ══════════════════════════════════════════════════════════════
@@ -475,52 +539,13 @@ end
 -- ══════════════════════════════════════════════════════════════
 
 menu_download = function()
-    local folder_id = browse_folders("download")
-    if not folder_id then return end
+    local result = browse_folders("download")
+    if not result then return end
 
-    local folder_name = folder_name_by_id(folder_id)
-    local files = list_files(folder_id)
-    if #files == 0 then return end
+    local to_process = result.files
+    if #to_process == 0 then return end
 
-    -- Check for expiring files and warn
-    local expiring = 0
-    for _, f in ipairs(files) do
-        if f.expiryDays and f.expiryDays <= 3 and not f.isPinned then expiring = expiring + 1 end
-    end
-    if expiring > 0 then
-        p(RD..B.."  ⚠ "..expiring.." file akan expire dalam 3 hari!"..NC); p("")
-    end
-
-    local apk_files = {}
-    for _, f in ipairs(files) do
-        if f.name:lower():find("%.apk") then apk_files[#apk_files+1] = f end
-    end
-    if #apk_files == 0 then
-        p(YL.."  No APK files. Available:"..NC)
-        for _, f in ipairs(files) do
-            local et = expiry_tag(f.expiryDays, f.isPinned)
-            p("    - "..f.name.." ("..f.sizefmt..") "..et)
-        end
-        return
-    end
-    table.sort(apk_files, function(a,b) return a.name:lower()<b.name:lower() end)
-
-    divider(); p(B.."  APK in "..folder_name..":"..NC); p("")
-    for i, f in ipairs(apk_files) do
-        local et = expiry_tag(f.expiryDays, f.isPinned)
-        local note = (f.description~="" and ("\n        "..DIM..trunc(f.description,50)..NC) or "")
-        p(string.format("  "..CY.."[%2d]"..NC.." %-32s %6s %s%s", i, trunc(f.name,32), f.sizefmt, et, note))
-    end
-    p(""); p("  Select APK:  Example: 1 | 1,3 | 2-4 | all")
-    divider(); pr(B.."  Choice: "..NC)
-    local input=trim(read_line()):gsub("\r",""); p("")
-
-    if input=="0" or input=="" then return end
-
-    local to_process = {}
-    local sel=parse_selection(input,#apk_files)
-    if #sel==0 then p(RD.."  Invalid."..NC); return end
-    for _,i in ipairs(sel) do to_process[#to_process+1]=apk_files[i] end
+    local folder_name = folder_name_by_id(result.folder_id)
 
     -- Warn if any selected file is about to expire
     local warn_files = {}
@@ -535,8 +560,15 @@ menu_download = function()
         p(YL.."  Download akan reset timer expiry."..NC); p("")
     end
 
+    -- Summary of selection
+    divider(); p(B.."  Selected from "..folder_name..":"..NC); p("")
+    for _, f in ipairs(to_process) do
+        p("  - "..trunc(f.name, 40).." "..DIM.."("..f.sizefmt..")"..NC)
+    end
+    p("")
+
     -- Download
-    p(""); divider(); p(B.."  Downloading "..#to_process.." files..."..NC); p("")
+    divider(); p(B.."  Downloading "..#to_process.." files..."..NC); p("")
     local dl_paths = {}
     for i,f in ipairs(to_process) do
         dl_paths[i] = download_file(f, i, #to_process)
@@ -585,31 +617,23 @@ end
 --   VIEW FILES
 -- ══════════════════════════════════════════════════════════════
 local function menu_view_files()
-    local folder_id = browse_folders("view")
-    if not folder_id then return end
+    local result = browse_folders("view")
+    if not result then return end
 
-    local folder_name = folder_name_by_id(folder_id)
-    local files = list_files(folder_id)
+    local files = result.files
     if #files == 0 then return end
 
-    table.sort(files, function(a,b) return a.name:lower()<b.name:lower() end)
+    local folder_name = folder_name_by_id(result.folder_id)
 
-    -- Count expiring
-    local expiring = 0
-    for _, f in ipairs(files) do
-        if f.expiryDays and f.expiryDays <= 7 and not f.isPinned then expiring = expiring + 1 end
-    end
-
-    divider(); p(B.."  Files in "..folder_name..":"..NC); p("")
-    if expiring > 0 then
-        p(YL.."  ⚠ "..expiring.." file akan expire dalam 7 hari"..NC); p("")
-    end
+    divider(); p(B.."  Selected from "..folder_name..":"..NC); p("")
     for i, f in ipairs(files) do
         local tag = (f.tags~="" and " ["..f.tags.."]" or "")
         local et = expiry_tag(f.expiryDays, f.isPinned)
         local note = (f.description~="" and ("\n        "..DIM..trunc(f.description,50)..NC) or "")
-        p(string.format("  "..CY.."[%2d]"..NC.." %-32s %6s %s%s%s", i, trunc(f.name,32), f.sizefmt, et, tag, note))
-    end; p("")
+        p(string.format("  "..CY.."[%2d]"..NC.." %-32s %6s %s%s%s",
+            i, trunc(f.name,32), f.sizefmt, et, tag, note))
+    end
+    p("")
 end
 
 -- ══════════════════════════════════════════════════════════════
