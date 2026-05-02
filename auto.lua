@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/lua
 
 local VERSION      = "3.2"
-local BASE_URL     = "https://ipantompal.anistioj.workers.dev"
+local BASE_URL     = "https://files.ipantools.uk"
 local TMP_DIR      = os.getenv("HOME") .. "/ipantompal_tmp"
 local DEST         = "/storage/emulated/0/Download"
 
